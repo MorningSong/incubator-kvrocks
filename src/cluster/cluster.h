@@ -35,11 +35,12 @@
 #include "redis_slot.h"
 #include "server/redis_connection.h"
 #include "status.h"
+#include "storage/scripting.h"
 
 class ClusterNode {
  public:
   explicit ClusterNode(std::string id, std::string host, int port, int role, std::string master_id,
-                       std::bitset<kClusterSlots> slots);
+                       const std::bitset<kClusterSlots> &slots);
   std::string id;
   std::string host;
   int port;
@@ -47,7 +48,7 @@ class ClusterNode {
   std::string master_id;
   std::bitset<kClusterSlots> slots;
   std::vector<std::string> replicas;
-  int importing_slot = -1;
+  SlotRange importing_slot_range = {-1, -1};
 };
 
 struct SlotInfo {
@@ -71,39 +72,43 @@ class Cluster {
   explicit Cluster(Server *srv, std::vector<std::string> binds, int port);
   Status SetClusterNodes(const std::string &nodes_str, int64_t version, bool force);
   Status GetClusterNodes(std::string *nodes_str);
+  StatusOr<std::string> GetReplicas(const std::string &node_id);
   Status SetNodeId(const std::string &node_id);
   Status SetSlotRanges(const std::vector<SlotRange> &slot_ranges, const std::string &node_id, int64_t version);
-  Status SetSlotMigrated(int slot, const std::string &ip_port);
-  Status SetSlotImported(int slot);
+  Status SetSlotRangeMigrated(const SlotRange &slot_range, const std::string &ip_port);
+  Status SetSlotRangeImported(const SlotRange &slot_range);
   Status GetSlotsInfo(std::vector<SlotInfo> *slot_infos);
   Status GetClusterInfo(std::string *cluster_infos);
   int64_t GetVersion() const { return version_; }
   static bool IsValidSlot(int slot) { return slot >= 0 && slot < kClusterSlots; }
   bool IsNotMaster();
-  bool IsWriteForbiddenSlot(int slot);
+  bool IsWriteForbiddenSlot(int slot) const;
   Status CanExecByMySelf(const redis::CommandAttributes *attributes, const std::vector<std::string> &cmd_tokens,
-                         redis::Connection *conn);
+                         redis::Connection *conn, lua::ScriptRunCtx *script_run_ctx = nullptr);
   Status SetMasterSlaveRepl();
-  Status MigrateSlot(int slot, const std::string &dst_node_id, SyncMigrateContext *blocking_ctx = nullptr);
-  Status ImportSlot(redis::Connection *conn, int slot, int state);
+  Status MigrateSlotRange(const SlotRange &slot_range, const std::string &dst_node_id,
+                          SyncMigrateContext *blocking_ctx = nullptr);
+  Status ImportSlotRange(redis::Connection *conn, const SlotRange &slot_range, int state);
   std::string GetMyId() const { return myid_; }
   Status DumpClusterNodes(const std::string &file);
   Status LoadClusterNodes(const std::string &file_path);
+  Status Reset();
 
   static bool SubCommandIsExecExclusive(const std::string &subcommand);
 
  private:
+  std::string getNodeIDBySlot(int slot) const;
   std::string genNodesDescription();
-  std::string genNodesInfo();
-  std::map<std::string, std::string> getClusterNodeSlots() const;
+  std::string genNodesInfo() const;
+  std::map<std::string, std::string, std::less<>> getClusterNodeSlots() const;
   SlotInfo genSlotNodeInfo(int start, int end, const std::shared_ptr<ClusterNode> &n);
   static Status parseClusterNodes(const std::string &nodes_str, ClusterNodes *nodes,
                                   std::unordered_map<int, std::string> *slots_nodes);
   Server *srv_;
   std::vector<std::string> binds_;
   int port_;
-  int size_;
-  int64_t version_;
+  int size_ = 0;
+  int64_t version_ = -1;
   std::string myid_;
   std::shared_ptr<ClusterNode> myself_;
   ClusterNodes nodes_;

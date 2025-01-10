@@ -49,6 +49,7 @@ enum RedisType : uint8_t {
   kRedisStream = 8,
   kRedisBloomFilter = 9,
   kRedisJson = 10,
+  kRedisHyperLogLog = 11,
 };
 
 struct RedisTypes {
@@ -64,7 +65,7 @@ struct RedisTypes {
     return RedisTypes(types);
   }
 
-  bool Contains(RedisType type) { return types_[type]; }
+  bool Contains(RedisType type) const { return types_[type]; }
 
  private:
   using UnderlyingType = std::bitset<128>;
@@ -90,8 +91,9 @@ enum RedisCommand {
   kRedisCmdLMove,
 };
 
-const std::vector<std::string> RedisTypeNames = {"none",   "string",    "hash",   "list",      "set",      "zset",
-                                                 "bitmap", "sortedint", "stream", "MBbloom--", "ReJSON-RL"};
+const std::vector<std::string> RedisTypeNames = {"none",   "string",    "hash",      "list",
+                                                 "set",    "zset",      "bitmap",    "sortedint",
+                                                 "stream", "MBbloom--", "ReJSON-RL", "hyperloglog"};
 
 constexpr const char *kErrMsgWrongType = "WRONGTYPE Operation against a key holding the wrong kind of value";
 constexpr const char *kErrMsgKeyExpired = "the key was expired";
@@ -105,6 +107,7 @@ struct KeyNumStats {
   uint64_t avg_ttl = 0;
 };
 
+[[nodiscard]] uint16_t ExtractSlotId(Slice ns_key);
 template <typename T = Slice>
 [[nodiscard]] std::tuple<T, T> ExtractNamespaceKey(Slice ns_key, bool slot_id_encoded);
 [[nodiscard]] std::string ComposeNamespaceKey(const Slice &ns, const Slice &key, bool slot_id_encoded);
@@ -311,4 +314,24 @@ class JsonMetadata : public Metadata {
 
   void Encode(std::string *dst) const override;
   rocksdb::Status Decode(Slice *input) override;
+};
+
+class HyperLogLogMetadata : public Metadata {
+ public:
+  enum class EncodeType : uint8_t {
+    // Redis-style dense encoding implement as bitmap like sub keys to
+    // store registers by segment in data column family.
+    // The registers are stored in 6-bit format and each segment contains
+    // 768 registers.
+    DENSE = 0,
+    // TODO(mwish): sparse encoding
+    // SPARSE = 1,
+  };
+
+  explicit HyperLogLogMetadata(bool generate_version = true) : Metadata(kRedisHyperLogLog, generate_version) {}
+
+  void Encode(std::string *dst) const override;
+  rocksdb::Status Decode(Slice *input) override;
+
+  EncodeType encode_type = EncodeType::DENSE;
 };

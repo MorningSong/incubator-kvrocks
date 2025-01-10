@@ -30,12 +30,16 @@
 #include <atomic>
 #include <csignal>
 #include <future>
+#include <memory>
 #include <string>
+#include <string_view>
 #include <thread>
 
+#include "commands/error_constants.h"
 #include "event_util.h"
 #include "fmt/format.h"
 #include "io_util.h"
+#include "rocksdb/write_batch.h"
 #include "rocksdb_crc32c.h"
 #include "scope_exit.h"
 #include "server/redis_reply.h"
@@ -61,7 +65,7 @@ Status FeedSlaveThread::Start() {
     sigaddset(&mask, SIGHUP);
     sigaddset(&mask, SIGPIPE);
     pthread_sigmask(SIG_BLOCK, &mask, &omask);
-    auto s = util::SockSend(conn_->GetFD(), redis::SimpleString("OK"), conn_->GetBufferEvent());
+    auto s = util::SockSend(conn_->GetFD(), redis::RESP_OK, conn_->GetBufferEvent());
     if (!s.IsOK()) {
       LOG(ERROR) << "failed to send OK response to the replica: " << s.Msg();
       return;
@@ -75,7 +79,7 @@ Status FeedSlaveThread::Start() {
     conn_ = nullptr;  // prevent connection was freed when failed to start the thread
   }
 
-  return s;
+  return std::move(s);
 }
 
 void FeedSlaveThread::Stop() {
@@ -201,7 +205,7 @@ LOOP_LABEL:
   assert(handler_idx_ <= handlers_.size());
   DLOG(INFO) << "[replication] Execute handler[" << getHandlerName(handler_idx_) << "]";
   auto st = getHandlerFunc(handler_idx_)(repl_, bev);
-  repl_->last_io_time_.store(util::GetTimeStamp(), std::memory_order_relaxed);
+  repl_->last_io_time_secs_.store(util::GetTimeStamp(), std::memory_order_relaxed);
   switch (st) {
     case CBState::NEXT:
       ++handler_idx_;
@@ -251,7 +255,6 @@ void ReplicationThread::CallbacksStateMachine::Start() {
   }
 
   uint64_t last_connect_timestamp = 0;
-  int connect_timeout_ms = 3100;
 
   while (!repl_->stop_flag_ && bev == nullptr) {
     if (util::GetTimeStampMS() - last_connect_timestamp < 1000) {
@@ -259,7 +262,7 @@ void ReplicationThread::CallbacksStateMachine::Start() {
       sleep(1);
     }
     last_connect_timestamp = util::GetTimeStampMS();
-    auto cfd = util::SockConnect(repl_->host_, repl_->port_, connect_timeout_ms);
+    auto cfd = util::SockConnect(repl_->host_, repl_->port_, repl_->srv_->GetConfig()->replication_connect_timeout_ms);
     if (!cfd) {
       LOG(ERROR) << "[replication] Failed to connect the master, err: " << cfd.Msg();
       continue;
@@ -336,7 +339,7 @@ ReplicationThread::ReplicationThread(std::string host, uint32_t port, Server *sr
                     CallbackType{CallbacksStateMachine::WRITE, "fullsync write", &ReplicationThread::fullSyncWriteCB},
                     CallbackType{CallbacksStateMachine::READ, "fullsync read", &ReplicationThread::fullSyncReadCB}}) {}
 
-Status ReplicationThread::Start(std::function<void()> &&pre_fullsync_cb, std::function<void()> &&post_fullsync_cb) {
+Status ReplicationThread::Start(std::function<bool()> &&pre_fullsync_cb, std::function<void()> &&post_fullsync_cb) {
   pre_fullsync_cb_ = std::move(pre_fullsync_cb);
   post_fullsync_cb_ = std::move(post_fullsync_cb);
 
@@ -402,13 +405,13 @@ ReplicationThread::CBState ReplicationThread::authWriteCB(bufferevent *bev) {
   return CBState::NEXT;
 }
 
-inline bool ResponseLineIsOK(const char *line) { return strncmp(line, "+OK", 3) == 0; }
+inline bool ResponseLineIsOK(std::string_view line) { return line == RESP_PREFIX_SIMPLE_STRING "OK"; }
 
 ReplicationThread::CBState ReplicationThread::authReadCB(bufferevent *bev) {  // NOLINT
   auto input = bufferevent_get_input(bev);
   UniqueEvbufReadln line(input, EVBUFFER_EOL_CRLF_STRICT);
   if (!line) return CBState::AGAIN;
-  if (!ResponseLineIsOK(line.get())) {
+  if (!ResponseLineIsOK(line.View())) {
     // Auth failed
     LOG(ERROR) << "[replication] Auth failed: " << line.get();
     return CBState::RESTART;
@@ -430,7 +433,7 @@ ReplicationThread::CBState ReplicationThread::checkDBNameReadCB(bufferevent *bev
   if (!line) return CBState::AGAIN;
 
   if (line[0] == '-') {
-    if (isRestoringError(line.get())) {
+    if (isRestoringError(line.View())) {
       LOG(WARNING) << "The master was restoring the db, retry later";
     } else {
       LOG(ERROR) << "Failed to get the db name, " << line.get();
@@ -468,18 +471,18 @@ ReplicationThread::CBState ReplicationThread::replConfReadCB(bufferevent *bev) {
   if (!line) return CBState::AGAIN;
 
   // on unknown option: first try without announce ip, if it fails again - do nothing (to prevent infinite loop)
-  if (isUnknownOption(line.get()) && !next_try_without_announce_ip_address_) {
+  if (isUnknownOption(line.View()) && !next_try_without_announce_ip_address_) {
     next_try_without_announce_ip_address_ = true;
     LOG(WARNING) << "The old version master, can't handle ip-address, "
                  << "try without it again";
     // Retry previous state, i.e. send replconf again
     return CBState::PREV;
   }
-  if (line[0] == '-' && isRestoringError(line.get())) {
+  if (line[0] == '-' && isRestoringError(line.View())) {
     LOG(WARNING) << "The master was restoring the db, retry later";
     return CBState::RESTART;
   }
-  if (!ResponseLineIsOK(line.get())) {
+  if (!ResponseLineIsOK(line.View())) {
     LOG(WARNING) << "[replication] Failed to replconf: " << line.get() + 1;
     //  backward compatible with old version that doesn't support replconf cmd
     return CBState::NEXT;
@@ -530,12 +533,12 @@ ReplicationThread::CBState ReplicationThread::tryPSyncReadCB(bufferevent *bev) {
   UniqueEvbufReadln line(input, EVBUFFER_EOL_CRLF_STRICT);
   if (!line) return CBState::AGAIN;
 
-  if (line[0] == '-' && isRestoringError(line.get())) {
+  if (line[0] == '-' && isRestoringError(line.View())) {
     LOG(WARNING) << "The master was restoring the db, retry later";
     return CBState::RESTART;
   }
 
-  if (line[0] == '-' && isWrongPsyncNum(line.get())) {
+  if (line[0] == '-' && isWrongPsyncNum(line.View())) {
     next_try_old_psync_ = true;
     LOG(WARNING) << "The old version master, can't handle new PSYNC, "
                  << "try old PSYNC again";
@@ -543,7 +546,7 @@ ReplicationThread::CBState ReplicationThread::tryPSyncReadCB(bufferevent *bev) {
     return CBState::PREV;
   }
 
-  if (!ResponseLineIsOK(line.get())) {
+  if (!ResponseLineIsOK(line.View())) {
     // PSYNC isn't OK, we should use FullSync
     // Switch to fullsync state machine
     fullsync_steps_.Start();
@@ -557,7 +560,6 @@ ReplicationThread::CBState ReplicationThread::tryPSyncReadCB(bufferevent *bev) {
 }
 
 ReplicationThread::CBState ReplicationThread::incrementBatchLoopCB(bufferevent *bev) {
-  char *bulk_data = nullptr;
   repl_state_.store(kReplConnected, std::memory_order_relaxed);
   auto input = bufferevent_get_input(bev);
   while (true) {
@@ -576,31 +578,38 @@ ReplicationThread::CBState ReplicationThread::incrementBatchLoopCB(bufferevent *
       }
       case Incr_batch_data:
         // Read bulk data (batch data)
-        if (incr_bulk_len_ + 2 <= evbuffer_get_length(input)) {  // We got enough data
-          bulk_data = reinterpret_cast<char *>(evbuffer_pullup(input, static_cast<ssize_t>(incr_bulk_len_ + 2)));
-          std::string bulk_string = std::string(bulk_data, incr_bulk_len_);
-          // master would send the ping heartbeat packet to check whether the slave was alive or not,
-          // don't write ping to db here.
-          if (bulk_string != "ping") {
-            auto s = storage_->ReplicaApplyWriteBatch(std::string(bulk_data, incr_bulk_len_));
-            if (!s.IsOK()) {
-              LOG(ERROR) << "[replication] CRITICAL - Failed to write batch to local, " << s.Msg() << ". batch: 0x"
-                         << util::StringToHex(bulk_string);
-              return CBState::RESTART;
-            }
-
-            s = parseWriteBatch(bulk_string);
-            if (!s.IsOK()) {
-              LOG(ERROR) << "[replication] CRITICAL - failed to parse write batch 0x" << util::StringToHex(bulk_string)
-                         << ": " << s.Msg();
-              return CBState::RESTART;
-            }
-          }
-          evbuffer_drain(input, incr_bulk_len_ + 2);
-          incr_state_ = Incr_batch_size;
-        } else {
+        if (incr_bulk_len_ + 2 > evbuffer_get_length(input)) {  // If data not enough
           return CBState::AGAIN;
         }
+
+        const char *bulk_data =
+            reinterpret_cast<const char *>(evbuffer_pullup(input, static_cast<ssize_t>(incr_bulk_len_ + 2)));
+        std::string bulk_string = std::string(bulk_data, incr_bulk_len_);
+        evbuffer_drain(input, incr_bulk_len_ + 2);
+        incr_state_ = Incr_batch_size;
+
+        if (bulk_string == "ping") {
+          // master would send the ping heartbeat packet to check whether the slave was alive or not,
+          // don't write ping to db here.
+          return CBState::AGAIN;
+        }
+
+        rocksdb::WriteBatch batch(std::move(bulk_string));
+
+        auto s = storage_->ReplicaApplyWriteBatch(&batch);
+        if (!s.IsOK()) {
+          LOG(ERROR) << "[replication] CRITICAL - Failed to write batch to local, " << s.Msg() << ". batch: 0x"
+                     << util::StringToHex(batch.Data());
+          return CBState::RESTART;
+        }
+
+        s = parseWriteBatch(batch);
+        if (!s.IsOK()) {
+          LOG(ERROR) << "[replication] CRITICAL - failed to parse write batch 0x" << util::StringToHex(batch.Data())
+                     << ": " << s.Msg();
+          return CBState::RESTART;
+        }
+
         break;
     }
   }
@@ -699,25 +708,28 @@ ReplicationThread::CBState ReplicationThread::fullSyncReadCB(bufferevent *bev) {
       fullsync_state_ = kFetchMetaID;
       LOG(INFO) << "[replication] Succeeded fetching full data files info, fetching files in parallel";
 
+      bool pre_fullsync_done = false;
       // If 'slave-empty-db-before-fullsync' is yes, we call 'pre_fullsync_cb_'
       // just like reloading database. And we don't want slave to occupy too much
       // disk space, so we just empty entire database rudely.
       if (srv_->GetConfig()->slave_empty_db_before_fullsync) {
-        pre_fullsync_cb_();
+        if (!pre_fullsync_cb_()) return CBState::RESTART;
+        pre_fullsync_done = true;
         storage_->EmptyDB();
       }
 
       repl_state_.store(kReplFetchSST, std::memory_order_relaxed);
       auto s = parallelFetchFile(target_dir, meta.files);
       if (!s.IsOK()) {
+        if (pre_fullsync_done) post_fullsync_cb_();
         LOG(ERROR) << "[replication] Failed to parallel fetch files while " + s.Msg();
         return CBState::RESTART;
       }
       LOG(INFO) << "[replication] Succeeded fetching files in parallel, restoring the backup";
 
-      // Restore DB from backup
-      // We already call 'pre_fullsync_cb_' if 'slave-empty-db-before-fullsync' is yes
-      if (!srv_->GetConfig()->slave_empty_db_before_fullsync) pre_fullsync_cb_();
+      // Don't need to call 'pre_fullsync_cb_' again if it was called before
+      if (!pre_fullsync_done && !pre_fullsync_cb_()) return CBState::RESTART;
+
       // For old version, master uses rocksdb backup to implement data snapshot
       if (srv_->GetConfig()->master_use_repl_port) {
         s = storage_->RestoreFromBackup();
@@ -726,10 +738,18 @@ ReplicationThread::CBState ReplicationThread::fullSyncReadCB(bufferevent *bev) {
       }
       if (!s.IsOK()) {
         LOG(ERROR) << "[replication] Failed to restore backup while " + s.Msg() + ", restart fullsync";
+        post_fullsync_cb_();
         return CBState::RESTART;
       }
       LOG(INFO) << "[replication] Succeeded restoring the backup, fullsync was finish";
       post_fullsync_cb_();
+
+      // It needs to reload namespaces from DB after the full sync is done,
+      // or namespaces are not visible in the replica.
+      s = srv_->GetNamespace()->LoadAndRewrite();
+      if (!s.IsOK()) {
+        LOG(ERROR) << "[replication] Failed to load and rewrite namespace: " << s.Msg();
+      }
 
       // Switch to psync state machine again
       psync_steps_.Start();
@@ -765,7 +785,10 @@ Status ReplicationThread::parallelFetchFile(const std::string &dir,
           }
           auto exit = MakeScopeExit([ssl] { SSL_free(ssl); });
 #endif
-          int sock_fd = GET_OR_RET(util::SockConnect(this->host_, this->port_, ssl).Prefixed("connect the server err"));
+          int sock_fd = GET_OR_RET(util::SockConnect(this->host_, this->port_, ssl,
+                                                     this->srv_->GetConfig()->replication_connect_timeout_ms,
+                                                     this->srv_->GetConfig()->replication_recv_timeout_ms)
+                                       .Prefixed("connect the server err"));
 #ifdef ENABLE_OPENSSL
           exit.Disable();
 #endif
@@ -844,7 +867,7 @@ Status ReplicationThread::sendAuth(int sock_fd, ssl_st *ssl) {
       }
       UniqueEvbufReadln line(evbuf.get(), EVBUFFER_EOL_CRLF_STRICT);
       if (!line) continue;
-      if (!ResponseLineIsOK(line.get())) {
+      if (!ResponseLineIsOK(line.View())) {
         return {Status::NotOK, "auth got invalid response"};
       }
       break;
@@ -862,6 +885,12 @@ Status ReplicationThread::fetchFile(int sock_fd, evbuffer *evbuf, const std::str
     UniqueEvbufReadln line(evbuf, EVBUFFER_EOL_CRLF_STRICT);
     if (!line) {
       if (auto s = util::EvbufferRead(evbuf, sock_fd, -1, ssl); !s) {
+        if (s.Is<Status::TryAgain>()) {
+          if (stop_flag_) {
+            return {Status::NotOK, "replication thread was stopped"};
+          }
+          continue;
+        }
         return std::move(s).Prefixed("read size");
       }
       continue;
@@ -895,6 +924,12 @@ Status ReplicationThread::fetchFile(int sock_fd, evbuffer *evbuf, const std::str
       remain -= data_len;
     } else {
       if (auto s = util::EvbufferRead(evbuf, sock_fd, -1, ssl); !s) {
+        if (s.Is<Status::TryAgain>()) {
+          if (stop_flag_) {
+            return {Status::NotOK, "replication thread was stopped"};
+          }
+          continue;
+        }
         return std::move(s).Prefixed("read sst file");
       }
     }
@@ -955,8 +990,7 @@ void ReplicationThread::TimerCB(int, int16_t) {
   }
 }
 
-Status ReplicationThread::parseWriteBatch(const std::string &batch_string) {
-  rocksdb::WriteBatch write_batch(batch_string);
+Status ReplicationThread::parseWriteBatch(const rocksdb::WriteBatch &write_batch) {
   WriteBatchHandler write_batch_handler;
 
   auto db_status = write_batch.Iterate(&write_batch_handler);
@@ -998,30 +1032,36 @@ Status ReplicationThread::parseWriteBatch(const std::string &batch_string) {
   return Status::OK();
 }
 
-bool ReplicationThread::isRestoringError(const char *err) {
-  return std::string(err) == "-ERR restoring the db from backup";
+bool ReplicationThread::isRestoringError(std::string_view err) {
+  // err doesn't contain the CRLF, so cannot use redis::Error here.
+  return err == RESP_PREFIX_ERROR + redis::StatusToRedisErrorMsg({Status::RedisLoading, redis::errRestoringBackup});
 }
 
-bool ReplicationThread::isWrongPsyncNum(const char *err) {
-  return std::string(err) == "-ERR wrong number of arguments";
+bool ReplicationThread::isWrongPsyncNum(std::string_view err) {
+  // err doesn't contain the CRLF, so cannot use redis::Error here.
+  return err == RESP_PREFIX_ERROR + redis::StatusToRedisErrorMsg({Status::NotOK, redis::errWrongNumArguments});
 }
 
-bool ReplicationThread::isUnknownOption(const char *err) { return std::string(err) == "-ERR unknown option"; }
+bool ReplicationThread::isUnknownOption(std::string_view err) {
+  // err doesn't contain the CRLF, so cannot use redis::Error here.
+  return err == RESP_PREFIX_ERROR + redis::StatusToRedisErrorMsg({Status::NotOK, redis::errUnknownOption});
+}
 
 rocksdb::Status WriteBatchHandler::PutCF(uint32_t column_family_id, const rocksdb::Slice &key,
                                          const rocksdb::Slice &value) {
   type_ = kBatchTypeNone;
-  if (column_family_id == kColumnFamilyIDPubSub) {
+  if (column_family_id == static_cast<uint32_t>(ColumnFamilyID::PubSub)) {
     type_ = kBatchTypePublish;
     kv_ = std::make_pair(key.ToString(), value.ToString());
     return rocksdb::Status::OK();
-  } else if (column_family_id == kColumnFamilyIDPropagate) {
+  } else if (column_family_id == static_cast<uint32_t>(ColumnFamilyID::Propagate)) {
     type_ = kBatchTypePropagate;
     kv_ = std::make_pair(key.ToString(), value.ToString());
     return rocksdb::Status::OK();
-  } else if (column_family_id == kColumnFamilyIDStream) {
+  } else if (column_family_id == static_cast<uint32_t>(ColumnFamilyID::Stream)) {
     type_ = kBatchTypeStream;
     kv_ = std::make_pair(key.ToString(), value.ToString());
+    return rocksdb::Status::OK();
   }
   return rocksdb::Status::OK();
 }

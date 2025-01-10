@@ -77,7 +77,6 @@ func ScanTest(t *testing.T, rdb *redis.Client, ctx context.Context) {
 		require.NoError(t, rdb.FlushDB(ctx).Err())
 		util.Populate(t, rdb, "", 1000, 10)
 		keys := scanAll(t, rdb)
-		keys = slices.Compact(keys)
 		require.Len(t, keys, 1000)
 	})
 
@@ -85,7 +84,6 @@ func ScanTest(t *testing.T, rdb *redis.Client, ctx context.Context) {
 		require.NoError(t, rdb.FlushDB(ctx).Err())
 		util.Populate(t, rdb, "", 1000, 10)
 		keys := scanAll(t, rdb, "count", 5)
-		keys = slices.Compact(keys)
 		require.Len(t, keys, 1000)
 	})
 
@@ -93,8 +91,46 @@ func ScanTest(t *testing.T, rdb *redis.Client, ctx context.Context) {
 		require.NoError(t, rdb.FlushDB(ctx).Err())
 		util.Populate(t, rdb, "key:", 1000, 10)
 		keys := scanAll(t, rdb, "match", "key:*")
-		keys = slices.Compact(keys)
 		require.Len(t, keys, 1000)
+	})
+
+	t.Run("SCAN MATCH non-trivial pattern", func(t *testing.T) {
+		require.NoError(t, rdb.FlushDB(ctx).Err())
+
+		for _, key := range []string{"aa", "aab", "aabb", "ab", "abb", "ba"} {
+			require.NoError(t, rdb.Set(ctx, key, "hello", 0).Err())
+		}
+
+		keys := scanAll(t, rdb, "match", "a*")
+		require.Equal(t, []string{"aa", "aab", "aabb", "ab", "abb"}, keys)
+
+		keys = scanAll(t, rdb, "match", "aa")
+		require.Equal(t, []string{"aa"}, keys)
+
+		keys = scanAll(t, rdb, "match", "aa*")
+		require.Equal(t, []string{"aa", "aab", "aabb"}, keys)
+
+		keys = scanAll(t, rdb, "match", "a?")
+		require.Equal(t, []string{"aa", "ab"}, keys)
+
+		keys = scanAll(t, rdb, "match", "a*?")
+		require.Equal(t, []string{"aa", "aab", "aabb", "ab", "abb"}, keys)
+
+		keys = scanAll(t, rdb, "match", "ab*")
+		require.Equal(t, []string{"ab", "abb"}, keys)
+
+		keys = scanAll(t, rdb, "match", "*ab")
+		require.Equal(t, []string{"aab", "ab"}, keys)
+
+		keys = scanAll(t, rdb, "match", "*ab*")
+		require.Equal(t, []string{"aab", "aabb", "ab", "abb"}, keys)
+
+		// Special case: using [b]* instead of b* forces the a full scan of the keyspace,
+		// matching every result with the pattern. We ask for exactly one key, but the
+		// first 5 keys don't match the pattern. This tests that SCAN returns a valid
+		// cursor even when the first [limit] keys don't satisfy the pattern.
+		keys = scanAll(t, rdb, "match", "[b]*", "count", "1")
+		require.Equal(t, []string{"ba"}, keys)
 	})
 
 	t.Run("SCAN guarantees check under write load", func(t *testing.T) {
@@ -219,6 +255,7 @@ func ScanTest(t *testing.T, rdb *redis.Client, ctx context.Context) {
 			require.NoError(t, rdb.SAdd(ctx, "set", elements...).Err())
 			keys, _, err := rdb.SScan(ctx, "set", 0, "", 10000).Result()
 			require.NoError(t, err)
+			slices.Sort(keys)
 			keys = slices.Compact(keys)
 			require.Len(t, keys, 100)
 		})
@@ -290,6 +327,89 @@ func ScanTest(t *testing.T, rdb *redis.Client, ctx context.Context) {
 			require.Len(t, zsetKeys, test.count)
 		})
 	}
+
+	t.Run("SCAN reject invalid input", func(t *testing.T) {
+		util.ErrorRegexp(t, rdb.Do(ctx, "SCAN", "0", "hello").Err(), ".*syntax error.*")
+		util.ErrorRegexp(t, rdb.Do(ctx, "SCAN", "0", "hello", "hi").Err(), ".*syntax error.*")
+		util.ErrorRegexp(t, rdb.Do(ctx, "SCAN", "0", "count", "1", "hello", "hi").Err(), ".*syntax error.*")
+		util.ErrorRegexp(t, rdb.Do(ctx, "SCAN", "0", "hello", "hi", "count", "1").Err(), ".*syntax error.*")
+		require.NoError(t, rdb.Do(ctx, "SCAN", "0", "count", "1", "match", "a*").Err())
+		require.NoError(t, rdb.Do(ctx, "SCAN", "0", "match", "a*", "count", "1").Err())
+		util.ErrorRegexp(t, rdb.Do(ctx, "SCAN", "0", "count", "1", "match", "a*", "hello").Err(), ".*syntax error.*")
+		util.ErrorRegexp(t, rdb.Do(ctx, "SCAN", "0", "count", "1", "match", "a*", "hello", "hi").Err(), ".*syntax error.*")
+
+		util.ErrorRegexp(t, rdb.Do(ctx, "SCAN", "0", "match", "[").Err(), ".*Invalid glob pattern.*")
+		util.ErrorRegexp(t, rdb.Do(ctx, "SCAN", "0", "match", "\\").Err(), ".*Invalid glob pattern.*")
+		util.ErrorRegexp(t, rdb.Do(ctx, "SCAN", "0", "match", "[a").Err(), ".*Invalid glob pattern.*")
+		util.ErrorRegexp(t, rdb.Do(ctx, "SCAN", "0", "match", "[a-]").Err(), ".*Invalid glob pattern.*")
+	})
+
+	t.Run("SCAN with type args ", func(t *testing.T) {
+		//string type
+		require.NoError(t, rdb.Set(ctx, "stringtype1", "fee1", 0).Err())
+		require.NoError(t, rdb.Set(ctx, "stringtype2", "fee1", 0).Err())
+		require.NoError(t, rdb.Set(ctx, "stringtype3", "fee1", 0).Err())
+		require.Equal(t, []string{"stringtype1", "stringtype2", "stringtype3"}, scanAll(t, rdb, "match", "stringtype*", "type", "string"))
+		require.Equal(t, []string{"stringtype1", "stringtype2", "stringtype3"}, scanAll(t, rdb, "match", "stringtype*", "count", "3", "type", "string"))
+		//hash type
+		require.NoError(t, rdb.HSet(ctx, "hashtype1", "key1", "val1", "key2", "val2").Err())
+		require.NoError(t, rdb.HSet(ctx, "hashtype2", "key1", "val1", "key2", "val2").Err())
+		require.NoError(t, rdb.HSet(ctx, "hashtype3", "key1", "val1", "key2", "val2").Err())
+		require.Equal(t, []string{"hashtype1", "hashtype2", "hashtype3"}, scanAll(t, rdb, "match", "hashtype*", "type", "hash"))
+		require.Equal(t, []string{"hashtype1", "hashtype2", "hashtype3"}, scanAll(t, rdb, "match", "hashtype*", "count", "3", "type", "hash"))
+		//list type
+		require.NoError(t, rdb.RPush(ctx, "listtype1", "1").Err())
+		require.NoError(t, rdb.RPush(ctx, "listtype2", "2").Err())
+		require.NoError(t, rdb.RPush(ctx, "listtype3", "3").Err())
+		require.Equal(t, []string{"listtype1", "listtype2", "listtype3"}, scanAll(t, rdb, "match", "listtype*", "type", "list"))
+		require.Equal(t, []string{"listtype1", "listtype2", "listtype3"}, scanAll(t, rdb, "match", "listtype*", "count", "3", "type", "list"))
+		//set type
+		require.NoError(t, rdb.SAdd(ctx, "settype1", "1").Err())
+		require.NoError(t, rdb.SAdd(ctx, "settype2", "1").Err())
+		require.NoError(t, rdb.SAdd(ctx, "settype3", "1").Err())
+		require.Equal(t, []string{"settype1", "settype2", "settype3"}, scanAll(t, rdb, "match", "settype*", "type", "set"))
+		require.Equal(t, []string{"settype1", "settype2", "settype3"}, scanAll(t, rdb, "match", "settype*", "count", "3", "type", "set"))
+		//zet type
+		members := []redis.Z{
+			{Score: 1, Member: "1"},
+			{Score: 2, Member: "2"},
+			{Score: 3, Member: "3"},
+			{Score: 10, Member: "4"},
+		}
+		require.NoError(t, rdb.ZAdd(ctx, "zsettype1", members...).Err())
+		require.NoError(t, rdb.ZAdd(ctx, "zsettype2", members...).Err())
+		require.NoError(t, rdb.ZAdd(ctx, "zsettype3", members...).Err())
+		require.Equal(t, []string{"zsettype1", "zsettype2", "zsettype3"}, scanAll(t, rdb, "match", "zsettype*", "type", "zset"))
+		require.Equal(t, []string{"zsettype1", "zsettype2", "zsettype3"}, scanAll(t, rdb, "match", "zsettype*", "count", "3", "type", "zset"))
+		//bitmap type
+		require.NoError(t, rdb.SetBit(ctx, "bitmaptype1", 0, 0).Err())
+		require.NoError(t, rdb.SetBit(ctx, "bitmaptype2", 0, 0).Err())
+		require.NoError(t, rdb.SetBit(ctx, "bitmaptype3", 0, 0).Err())
+		require.Equal(t, []string{"bitmaptype1", "bitmaptype2", "bitmaptype3"}, scanAll(t, rdb, "match", "bitmaptype*", "type", "bitmap"))
+		require.Equal(t, []string{"bitmaptype1", "bitmaptype2", "bitmaptype3"}, scanAll(t, rdb, "match", "bitmaptype*", "count", "3", "type", "bitmap"))
+		//stream type
+		require.NoError(t, rdb.XAdd(ctx, &redis.XAddArgs{Stream: "streamtype1", Values: []string{"item", "1", "value", "a"}}).Err())
+		require.NoError(t, rdb.XAdd(ctx, &redis.XAddArgs{Stream: "streamtype2", Values: []string{"item", "1", "value", "a"}}).Err())
+		require.NoError(t, rdb.XAdd(ctx, &redis.XAddArgs{Stream: "streamtype3", Values: []string{"item", "1", "value", "a"}}).Err())
+		require.Equal(t, []string{"streamtype1", "streamtype2", "streamtype3"}, scanAll(t, rdb, "match", "streamtype*", "type", "stream"))
+		require.Equal(t, []string{"streamtype1", "streamtype2", "streamtype3"}, scanAll(t, rdb, "match", "streamtype*", "count", "3", "type", "stream"))
+		//MBbloom type
+		require.NoError(t, rdb.Do(ctx, "bf.reserve", "MBbloomtype1", "0.02", "1000").Err())
+		require.NoError(t, rdb.Do(ctx, "bf.reserve", "MBbloomtype2", "0.02", "1000").Err())
+		require.NoError(t, rdb.Do(ctx, "bf.reserve", "MBbloomtype3", "0.02", "1000").Err())
+		require.Equal(t, []string{"MBbloomtype1", "MBbloomtype2", "MBbloomtype3"}, scanAll(t, rdb, "match", "MBbloomtype*", "type", "MBbloom--"))
+		require.Equal(t, []string{"MBbloomtype1", "MBbloomtype2", "MBbloomtype3"}, scanAll(t, rdb, "match", "MBbloomtype*", "count", "3", "type", "MBbloom--"))
+		//ReJSON-RL type
+		require.NoError(t, rdb.Do(ctx, "JSON.SET", "ReJSONtype1", "$", ` {"x":1, "y":2} `).Err())
+		require.NoError(t, rdb.Do(ctx, "JSON.SET", "ReJSONtype2", "$", ` {"x":1, "y":2} `).Err())
+		require.NoError(t, rdb.Do(ctx, "JSON.SET", "ReJSONtype3", "$", ` {"x":1, "y":2} `).Err())
+		require.Equal(t, []string{"ReJSONtype1", "ReJSONtype2", "ReJSONtype3"}, scanAll(t, rdb, "match", "ReJSONtype*", "type", "ReJSON-RL"))
+		require.Equal(t, []string{"ReJSONtype1", "ReJSONtype2", "ReJSONtype3"}, scanAll(t, rdb, "match", "ReJSONtype*", "count", "3", "type", "ReJSON-RL"))
+		//invalid type
+		util.ErrorRegexp(t, rdb.Do(ctx, "SCAN", "0", "count", "1", "match", "a*", "type", "hi").Err(), "Invalid type")
+
+	})
+
 }
 
 // SCAN of Kvrocks returns _cursor instead of cursor. Thus, redis.Client Scan can fail with
@@ -321,6 +441,8 @@ func scanAll(t testing.TB, rdb *redis.Client, args ...interface{}) (keys []strin
 		keys = append(keys, keyList...)
 
 		if c == "0" {
+			slices.Sort(keys)
+			keys = slices.Compact(keys)
 			return
 		}
 	}

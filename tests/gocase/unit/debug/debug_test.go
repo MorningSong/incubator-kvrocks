@@ -44,6 +44,7 @@ func TestDebugProtocolV2(t *testing.T) {
 		types := map[string]interface{}{
 			"string":  "Hello World",
 			"integer": int64(12345),
+			"double":  "3.141",
 			"array":   []interface{}{int64(0), int64(1), int64(2)},
 			"set":     []interface{}{int64(0), int64(1), int64(2)},
 			"map":     []interface{}{int64(0), int64(0), int64(1), int64(1), int64(2), int64(0)},
@@ -89,6 +90,7 @@ func TestDebugProtocolV3(t *testing.T) {
 		types := map[string]interface{}{
 			"string":  "Hello World",
 			"integer": int64(12345),
+			"double":  3.141,
 			"array":   []interface{}{int64(0), int64(1), int64(2)},
 			"set":     []interface{}{int64(0), int64(1), int64(2)},
 			"map":     map[interface{}]interface{}{int64(0): false, int64(1): true, int64(2): false},
@@ -115,5 +117,29 @@ func TestDebugProtocolV3(t *testing.T) {
 		val, err = returnValueScript.Run(ctx, rdb, []string{}, false).Bool()
 		require.NoError(t, err)
 		require.EqualValues(t, false, val)
+	})
+}
+
+func TestDebugDBSizeLimit(t *testing.T) {
+	srv := util.StartServer(t, map[string]string{})
+	defer srv.Close()
+
+	ctx := context.Background()
+	rdb := srv.NewClient()
+	defer func() { require.NoError(t, rdb.Close()) }()
+
+	t.Run("debug ignore dbsize check", func(t *testing.T) {
+		r := rdb.Do(ctx, "SET", "k1", "v1")
+		require.NoError(t, r.Err())
+
+		r = rdb.Do(ctx, "DEBUG", "DBSIZE-LIMIT", "1")
+		require.NoError(t, r.Err())
+
+		r = rdb.Do(ctx, "SET", "k2", "v2")
+		require.Error(t, r.Err())
+		util.ErrorRegexp(t, r.Err(), "ERR.*not allowed.*")
+
+		r = rdb.Do(ctx, "DEL", "k1")
+		require.NoError(t, r.Err())
 	})
 }

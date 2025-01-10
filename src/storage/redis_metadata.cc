@@ -96,9 +96,21 @@ std::string InternalKey::Encode() const {
 }
 
 bool InternalKey::operator==(const InternalKey &that) const {
+  if (namespace_ != this->namespace_) return false;
   if (key_ != that.key_) return false;
   if (sub_key_ != that.sub_key_) return false;
   return version_ == that.version_;
+}
+
+// Must slot encoded
+uint16_t ExtractSlotId(Slice ns_key) {
+  uint8_t namespace_size = 0;
+  GetFixed8(&ns_key, &namespace_size);
+  ns_key.remove_prefix(namespace_size);
+
+  uint16_t slot_id = HASH_SLOTS_SIZE;
+  GetFixed16(&ns_key, &slot_id);
+  return slot_id;
 }
 
 template <typename T>
@@ -317,7 +329,7 @@ bool Metadata::ExpireAt(uint64_t expired_ts) const {
 bool Metadata::IsSingleKVType() const { return Type() == kRedisString || Type() == kRedisJson; }
 
 bool Metadata::IsEmptyableType() const {
-  return IsSingleKVType() || Type() == kRedisStream || Type() == kRedisBloomFilter;
+  return IsSingleKVType() || Type() == kRedisStream || Type() == kRedisBloomFilter || Type() == kRedisHyperLogLog;
 }
 
 bool Metadata::Expired() const { return ExpireAt(util::GetTimeStampMS()); }
@@ -457,6 +469,29 @@ rocksdb::Status JsonMetadata::Decode(Slice *input) {
   if (!GetFixed8(input, reinterpret_cast<uint8_t *>(&format))) {
     return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
   }
+
+  return rocksdb::Status::OK();
+}
+
+void HyperLogLogMetadata::Encode(std::string *dst) const {
+  Metadata::Encode(dst);
+  PutFixed8(dst, static_cast<uint8_t>(this->encode_type));
+}
+
+rocksdb::Status HyperLogLogMetadata::Decode(Slice *input) {
+  if (auto s = Metadata::Decode(input); !s.ok()) {
+    return s;
+  }
+
+  uint8_t encoded_type = 0;
+  if (!GetFixed8(input, &encoded_type)) {
+    return rocksdb::Status::InvalidArgument(kErrMetadataTooShort);
+  }
+  // Check validity of encode type
+  if (encoded_type > 0) {
+    return rocksdb::Status::InvalidArgument(fmt::format("Invalid encode type {}", encoded_type));
+  }
+  this->encode_type = static_cast<EncodeType>(encoded_type);
 
   return rocksdb::Status::OK();
 }
