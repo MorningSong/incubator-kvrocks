@@ -46,6 +46,7 @@ TEST(Config, GetAndSet) {
       {"masterauth", "mytest_masterauth"},
       {"compact-cron", "1 2 3 4 5"},
       {"bgsave-cron", "5 4 3 2 1"},
+      {"dbsize-scan-cron", "1 2 3 2 1"},
       {"max-io-mb", "5000"},
       {"max-db-size", "6000"},
       {"max-replication-mb", "7000"},
@@ -66,7 +67,7 @@ TEST(Config, GetAndSet) {
       {"rocksdb.max_write_buffer_number", "1"},
       {"rocksdb.target_file_size_base", "100"},
       {"rocksdb.max_background_compactions", "-1"},
-      {"rocksdb.max_sub_compactions", "3"},
+      {"rocksdb.max_subcompactions", "3"},
       {"rocksdb.delayed_write_rate", "1234"},
       {"rocksdb.stats_dump_period_sec", "600"},
       {"rocksdb.compaction_readahead_size", "1024"},
@@ -81,6 +82,7 @@ TEST(Config, GetAndSet) {
       {"rocksdb.max_bytes_for_level_multiplier", "10"},
       {"rocksdb.level_compaction_dynamic_level_bytes", "yes"},
       {"rocksdb.max_background_jobs", "4"},
+      {"rocksdb.compression_start_level", "2"},
   };
   std::vector<std::string> values;
   for (const auto &iter : mutable_cases) {
@@ -126,6 +128,10 @@ TEST(Config, GetAndSet) {
       {"rocksdb.subkey_block_cache_size", "100"},
       {"rocksdb.row_cache_size", "100"},
       {"rocksdb.rate_limiter_auto_tuned", "yes"},
+      {"rocksdb.compression_level", "32767"},
+      {"rocksdb.wal_compression", "no"},
+      {"histogram-bucket-boundaries", "10,100,1000,10000"},
+
   };
   for (const auto &iter : immutable_cases) {
     s = config.Set(nullptr, iter.first, iter.second);
@@ -174,6 +180,8 @@ TEST(Config, Rewrite) {
   redis::CommandTable::Reset();
   Config config;
   ASSERT_TRUE(config.Load(CLIOptions(path)).IsOK());
+  ASSERT_EQ(config.dir + "/backup", config.backup_dir);
+  ASSERT_EQ(config.dir + "/kvrocks.pid", config.pidfile);
   ASSERT_TRUE(config.Rewrite({}).IsOK());
   // Need to re-populate the command table since it has renamed by the previous
   redis::CommandTable::Reset();

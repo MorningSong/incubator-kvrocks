@@ -34,7 +34,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
-	"github.com/shirou/gopsutil/v3/process"
+	"github.com/shirou/gopsutil/v4/process"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/exp/slices"
 )
@@ -83,11 +83,19 @@ func (s *KvrocksServer) NewClient() *redis.Client {
 	return s.NewClientWithOption(&redis.Options{})
 }
 
+func optionsWithTimeouts(options *redis.Options) *redis.Options {
+	options.DialTimeout = 30 * time.Second
+	options.ReadTimeout = 30 * time.Second
+	options.WriteTimeout = 30 * time.Second
+	return options
+}
+
 func (s *KvrocksServer) NewClientWithOption(options *redis.Options) *redis.Client {
 	if options.Addr == "" {
 		options.Addr = s.addr.String()
 	}
-	return redis.NewClient(options)
+
+	return redis.NewClient(optionsWithTimeouts(options))
 }
 
 func (s *KvrocksServer) NewTCPClient() *TCPClient {
@@ -104,6 +112,10 @@ func (s *KvrocksServer) NewTCPTLSClient(conf *tls.Config) *TCPClient {
 
 func (s *KvrocksServer) Close() {
 	s.close(false)
+}
+
+func (s *KvrocksServer) CloseWithoutCleanup() {
+	s.close(true)
 }
 
 func (s *KvrocksServer) close(keepDir bool) {
@@ -136,7 +148,10 @@ func (s *KvrocksServer) close(keepDir bool) {
 
 func (s *KvrocksServer) Restart() {
 	s.close(true)
+	s.Start()
+}
 
+func (s *KvrocksServer) Start() {
 	b := *binPath
 	require.NotEmpty(s.t, b, "please set the binary path by `-binPath`")
 	cmd := exec.Command(b)

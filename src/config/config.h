@@ -36,6 +36,7 @@
 
 // forward declaration
 class Server;
+enum class MigrationType;
 namespace engine {
 class Storage;
 }
@@ -53,14 +54,9 @@ constexpr const size_t GiB = 1024L * MiB;
 constexpr const uint32_t kDefaultPort = 6666;
 
 constexpr const char *kDefaultNamespace = "__namespace";
+constexpr int KVROCKS_MAX_LSM_LEVEL = 7;
 
-struct CompactionCheckerRange {
- public:
-  int start;
-  int stop;
-
-  bool Enabled() const { return start != -1 || stop != -1; }
-};
+enum class BlockCacheType { kCacheTypeLRU = 0, kCacheTypeHCC };
 
 struct CLIOptions {
   std::string conf_file;
@@ -75,6 +71,7 @@ struct Config {
   Config();
   ~Config() = default;
   uint32_t port = 0;
+  int socket_fd = -1;
 
   uint32_t tls_port = 0;
   std::string tls_cert_file;
@@ -101,12 +98,15 @@ struct Config {
   int max_backup_keep_hours = 24;
   int slowlog_log_slower_than = 100000;
   int slowlog_max_len = 128;
+  uint64_t proto_max_bulk_len = 512 * 1024 * 1024;
   bool daemonize = false;
   SupervisedMode supervised_mode = kSupervisedNone;
   bool slave_readonly = true;
   bool slave_serve_stale_data = true;
   bool slave_empty_db_before_fullsync = false;
   int slave_priority = 100;
+  int replication_connect_timeout_ms = 3100;
+  int replication_recv_timeout_ms = 3200;
   int max_db_size = 0;
   int max_replication_mb = 0;
   int max_io_mb = 0;
@@ -119,6 +119,8 @@ struct Config {
   std::vector<std::string> binds;
   std::string dir;
   std::string db_dir;
+  std::string backup_dir;  // GUARD_BY(backup_mu_)
+  std::string pidfile;
   std::string backup_sync_dir;
   std::string checkpoint_dir;
   std::string sync_checkpoint_dir;
@@ -132,7 +134,8 @@ struct Config {
   uint32_t master_port = 0;
   Cron compact_cron;
   Cron bgsave_cron;
-  CompactionCheckerRange compaction_checker_range{-1, -1};
+  Cron dbsize_scan_cron;
+  Cron compaction_checker_cron;
   int64_t force_compact_file_age;
   int force_compact_file_min_deleted_percentage;
   bool repl_namespace_enabled = false;
@@ -142,9 +145,13 @@ struct Config {
   bool persist_cluster_nodes_enabled = true;
   bool slot_id_encoded = false;
   bool cluster_enabled = false;
+
   int migrate_speed;
   int pipeline_size;
   int sequence_gap;
+  MigrationType migrate_type;
+  int migrate_batch_size_kb;
+  int migrate_batch_rate_limit_mb;
 
   bool redis_cursor_compatible = false;
   bool resp3_enabled = false;
@@ -165,10 +172,18 @@ struct Config {
   int json_max_nesting_depth = 1024;
   JsonStorageFormat json_storage_format = JsonStorageFormat::JSON;
 
+  // Enable transactional mode in engine::Context
+  bool txn_context_enabled = false;
+
+  bool skip_block_cache_deallocation_on_close = false;
+
+  std::vector<double> histogram_bucket_boundaries;
+
   struct RocksDB {
     int block_size;
     bool cache_index_and_filter_blocks;
     int block_cache_size;
+    BlockCacheType block_cache_type;
     int metadata_block_cache_size;
     int subkey_block_cache_size;
     bool share_metadata_and_subkey_block_cache;
@@ -178,19 +193,23 @@ struct Config {
     int max_write_buffer_number;
     int max_background_compactions;
     int max_background_flushes;
-    int max_sub_compactions;
+    int max_subcompactions;
     int stats_dump_period_sec;
     bool enable_pipelined_write;
     int64_t delayed_write_rate;
     int compaction_readahead_size;
     int target_file_size_base;
+    rocksdb::CompressionType wal_compression;
     int wal_ttl_seconds;
     int wal_size_limit_mb;
     int max_total_wal_size;
+    bool dump_malloc_stats;
     int level0_slowdown_writes_trigger;
     int level0_stop_writes_trigger;
     int level0_file_num_compaction_trigger;
     rocksdb::CompressionType compression;
+    int compression_start_level;
+    int compression_level;
     bool disable_auto_compactions;
     bool enable_blob_files;
     int min_blob_size;
@@ -203,6 +222,7 @@ struct Config {
     int max_background_jobs;
     bool rate_limiter_auto_tuned;
     bool avoid_unnecessary_blocking_io = true;
+    bool partition_filters;
 
     struct WriteOptions {
       bool sync;
@@ -210,6 +230,7 @@ struct Config {
       bool no_slowdown;
       bool low_pri;
       bool memtable_insert_hint_per_batch;
+      int write_batch_max_bytes;
     } write_options;
 
     struct ReadOptions {
@@ -228,21 +249,21 @@ struct Config {
   void ClearMaster();
   bool IsSlave() const { return !master_host.empty(); }
   bool HasConfigFile() const { return !path_.empty(); }
-  std::string GetBackupDir() const { return backup_dir_.empty() ? dir + "/backup" : backup_dir_; }
-  std::string GetPidFile() const { return pidfile_.empty() ? dir + "/kvrocks.pid" : pidfile_; }
+  std::string ConfigFilePath() const { return path_; }
 
  private:
   std::string path_;
-  std::string backup_dir_;  // GUARD_BY(backup_mu_)
-  std::string pidfile_;
   std::string binds_str_;
   std::string slaveof_;
   std::string compact_cron_str_;
   std::string bgsave_cron_str_;
+  std::string dbsize_scan_cron_str_;
   std::string compaction_checker_range_str_;
+  std::string compaction_checker_cron_str_;
   std::string profiling_sample_commands_str_;
   std::map<std::string, std::unique_ptr<ConfigField>> fields_;
   std::vector<std::string> rename_command_;
+  std::string histogram_bucket_boundaries_str_;
 
   void initFieldValidator();
   void initFieldCallback();

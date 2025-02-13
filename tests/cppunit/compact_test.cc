@@ -41,17 +41,19 @@ TEST(Compact, Filter) {
   auto hash = std::make_unique<redis::Hash>(storage.get(), ns);
   std::string expired_hash_key = "expire_hash_key";
   std::string live_hash_key = "live_hash_key";
-  hash->Set(expired_hash_key, "f1", "v1", &ret);
-  hash->Set(expired_hash_key, "f2", "v2", &ret);
-  auto st = hash->Expire(expired_hash_key, 1);  // expired
+
+  engine::Context ctx(storage.get());
+
+  hash->Set(ctx, expired_hash_key, "f1", "v1", &ret);
+  hash->Set(ctx, expired_hash_key, "f2", "v2", &ret);
+  auto st = hash->Expire(ctx, expired_hash_key, 1);  // expired
   usleep(10000);
-  hash->Set(live_hash_key, "f1", "v1", &ret);
-  hash->Set(live_hash_key, "f2", "v2", &ret);
+  hash->Set(ctx, live_hash_key, "f1", "v1", &ret);
+  hash->Set(ctx, live_hash_key, "f2", "v2", &ret);
 
   auto status = storage->Compact(nullptr, nullptr, nullptr);
   assert(status.ok());
   // Compact twice to workaround issue fixed by: https://github.com/facebook/rocksdb/pull/11468
-  // before rocksdb/speedb 8.1.1. This line can be removed after speedb upgraded above 8.1.1.
   status = storage->Compact(nullptr, nullptr, nullptr);
   assert(status.ok());
 
@@ -60,17 +62,17 @@ TEST(Compact, Filter) {
   read_options.snapshot = db->GetSnapshot();
   read_options.fill_cache = false;
 
-  auto new_iterator = [db, read_options, &storage](const std::string& name) {
-    return std::unique_ptr<rocksdb::Iterator>(db->NewIterator(read_options, storage->GetCFHandle(name)));
+  auto new_iterator = [db, read_options, &storage](ColumnFamilyID column_family_id) {
+    return std::unique_ptr<rocksdb::Iterator>(db->NewIterator(read_options, storage->GetCFHandle(column_family_id)));
   };
 
-  auto iter = new_iterator("metadata");
+  auto iter = new_iterator(ColumnFamilyID::Metadata);
   for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
     auto [user_ns, user_key] = ExtractNamespaceKey(iter->key(), storage->IsSlotIdEncoded());
     EXPECT_EQ(user_key.ToString(), live_hash_key);
   }
 
-  iter = new_iterator("subkey");
+  iter = new_iterator(ColumnFamilyID::PrimarySubkey);
   for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
     InternalKey ikey(iter->key(), storage->IsSlotIdEncoded());
     EXPECT_EQ(ikey.GetKey().ToString(), live_hash_key);
@@ -79,38 +81,38 @@ TEST(Compact, Filter) {
   auto zset = std::make_unique<redis::ZSet>(storage.get(), ns);
   std::string expired_zset_key = "expire_zset_key";
   std::vector<MemberScore> member_scores = {MemberScore{"z1", 1.1}, MemberScore{"z2", 0.4}};
-  zset->Add(expired_zset_key, ZAddFlags::Default(), &member_scores, &ret);
-  st = zset->Expire(expired_zset_key, 1);  // expired
+  zset->Add(ctx, expired_zset_key, ZAddFlags::Default(), &member_scores, &ret);
+  st = zset->Expire(ctx, expired_zset_key, 1);  // expired
   usleep(10000);
 
   // Same as the above compact, need to compact twice here
   status = storage->Compact(nullptr, nullptr, nullptr);
-  assert(status.ok());
+  EXPECT_TRUE(status.ok());
   status = storage->Compact(nullptr, nullptr, nullptr);
-  assert(status.ok());
+  EXPECT_TRUE(status.ok());
 
-  iter = new_iterator("default");
+  iter = new_iterator(ColumnFamilyID::PrimarySubkey);
   for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
     InternalKey ikey(iter->key(), storage->IsSlotIdEncoded());
     EXPECT_EQ(ikey.GetKey().ToString(), live_hash_key);
   }
 
-  iter = new_iterator("zset_score");
+  iter = new_iterator(ColumnFamilyID::SecondarySubkey);
   for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
     EXPECT_TRUE(false);  // never reach here
   }
 
   Slice mk_with_ttl = "mk_with_ttl";
-  hash->Set(mk_with_ttl, "f1", "v1", &ret);
-  hash->Set(mk_with_ttl, "f2", "v2", &ret);
+  hash->Set(ctx, mk_with_ttl, "f1", "v1", &ret);
+  hash->Set(ctx, mk_with_ttl, "f2", "v2", &ret);
 
   int retry = 2;
   while (retry-- > 0) {
     status = storage->Compact(nullptr, nullptr, nullptr);
-    assert(status.ok());
+    ASSERT_TRUE(status.ok());
     std::vector<FieldValue> fieldvalues;
-    auto get_res = hash->GetAll(mk_with_ttl, &fieldvalues);
-    auto s_expire = hash->Expire(mk_with_ttl, 1);  // expired immediately..
+    auto get_res = hash->GetAll(ctx, mk_with_ttl, &fieldvalues);
+    auto s_expire = hash->Expire(ctx, mk_with_ttl, 1);  // expired immediately..
 
     if (retry == 1) {
       ASSERT_TRUE(get_res.ok());  // not expired first time

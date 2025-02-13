@@ -29,10 +29,10 @@ namespace redis {
 template <bool evalsha, bool read_only>
 class CommandEvalImpl : public Commander {
  public:
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute([[maybe_unused]] engine::Context &ctx, [[maybe_unused]] Server *srv, Connection *conn,
+                 std::string *output) override {
     if (evalsha && args_[1].size() != 40) {
-      *output = redis::Error(errNoMatchingScript);
-      return Status::OK();
+      return {Status::RedisNoScript, errNoMatchingScript};
     }
 
     int64_t numkeys = GET_OR_RET(ParseInt<int64_t>(args_[2], 10));
@@ -63,7 +63,8 @@ class CommandScript : public Commander {
     return Status::OK();
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute([[maybe_unused]] engine::Context &ctx, Server *srv, [[maybe_unused]] Connection *conn,
+                 std::string *output) override {
     // There's a little tricky here since the script command was the write type
     // command but some subcommands like `exists` were readonly, so we want to allow
     // executing on slave here. Maybe we should find other way to do this.
@@ -82,7 +83,7 @@ class CommandScript : public Commander {
         LOG(ERROR) << "Failed to propagate script command: " << s.Msg();
         return s;
       }
-      *output = redis::SimpleString("OK");
+      *output = redis::RESP_OK;
     } else if (args_.size() >= 3 && subcommand_ == "exists") {
       *output = redis::MultiLen(args_.size() - 2);
       for (size_t j = 2; j < args_.size(); j++) {
@@ -94,7 +95,7 @@ class CommandScript : public Commander {
       }
     } else if (args_.size() == 3 && subcommand_ == "load") {
       std::string sha;
-      auto s = lua::CreateFunction(srv, args_[2], &sha, srv->Lua(), true);
+      auto s = lua::CreateFunction(srv, args_[2], &sha, conn->Owner()->Lua(), true);
       if (!s.IsOK()) {
         return s;
       }
@@ -116,12 +117,18 @@ CommandKeyRange GetScriptEvalKeyRange(const std::vector<std::string> &args) {
   return {3, 2 + numkeys, 1};
 }
 
-REDIS_REGISTER_COMMANDS(MakeCmdAttr<CommandEval>("eval", -3, "exclusive write no-script", GetScriptEvalKeyRange),
-                        MakeCmdAttr<CommandEvalSHA>("evalsha", -3, "exclusive write no-script", GetScriptEvalKeyRange),
-                        MakeCmdAttr<CommandEvalRO>("eval_ro", -3, "read-only no-script ro-script",
-                                                   GetScriptEvalKeyRange),
-                        MakeCmdAttr<CommandEvalSHARO>("evalsha_ro", -3, "read-only no-script ro-script",
-                                                      GetScriptEvalKeyRange),
-                        MakeCmdAttr<CommandScript>("script", -2, "exclusive no-script", 0, 0, 0), )
+uint64_t GenerateScriptFlags(uint64_t flags, const std::vector<std::string> &args) {
+  if (args.size() >= 2 && (util::EqualICase(args[1], "load") || util::EqualICase(args[1], "flush"))) {
+    return flags | kCmdWrite;
+  }
+
+  return flags;
+}
+
+REDIS_REGISTER_COMMANDS(Script, MakeCmdAttr<CommandEval>("eval", -3, "write no-script", GetScriptEvalKeyRange),
+                        MakeCmdAttr<CommandEvalSHA>("evalsha", -3, "write no-script", GetScriptEvalKeyRange),
+                        MakeCmdAttr<CommandEvalRO>("eval_ro", -3, "read-only no-script", GetScriptEvalKeyRange),
+                        MakeCmdAttr<CommandEvalSHARO>("evalsha_ro", -3, "read-only no-script", GetScriptEvalKeyRange),
+                        MakeCmdAttr<CommandScript>("script", -2, "exclusive no-script", NO_KEY, GenerateScriptFlags), )
 
 }  // namespace redis

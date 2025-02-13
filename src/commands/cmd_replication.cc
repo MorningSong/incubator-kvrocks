@@ -22,6 +22,7 @@
 #include "error_constants.h"
 #include "io_util.h"
 #include "scope_exit.h"
+#include "server/redis_reply.h"
 #include "server/server.h"
 #include "thread_util.h"
 #include "time_util.h"
@@ -55,7 +56,7 @@ class CommandPSync : public Commander {
     return Commander::Parse(args);
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute([[maybe_unused]] engine::Context &ctx, Server *srv, Connection *conn, std::string *output) override {
     LOG(INFO) << "Slave " << conn->GetAddr() << ", listening port: " << conn->GetListeningPort()
               << ", announce ip: " << conn->GetAnnounceIP() << " asks for synchronization"
               << " with next sequence: " << next_repl_seq_
@@ -101,7 +102,7 @@ class CommandPSync : public Commander {
     srv->stats.IncrPSyncOKCount();
     s = srv->AddSlave(conn, next_repl_seq_);
     if (!s.IsOK()) {
-      std::string err = "-ERR " + s.Msg() + "\r\n";
+      std::string err = redis::Error(s);
       s = util::SockSend(conn->GetFD(), err, conn->GetBufferEvent());
       if (!s.IsOK()) {
         LOG(WARNING) << "failed to send error message to the replica: " << s.Msg();
@@ -185,14 +186,15 @@ class CommandReplConf : public Commander {
     return Status::OK();
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute([[maybe_unused]] engine::Context &ctx, [[maybe_unused]] Server *srv, Connection *conn,
+                 std::string *output) override {
     if (port_ != 0) {
       conn->SetListeningPort(port_);
     }
     if (!ip_address_.empty()) {
       conn->SetAnnounceIP(ip_address_);
     }
-    *output = redis::SimpleString("OK");
+    *output = redis::RESP_OK;
     return Status::OK();
   }
 
@@ -203,9 +205,10 @@ class CommandReplConf : public Commander {
 
 class CommandFetchMeta : public Commander {
  public:
-  Status Parse(const std::vector<std::string> &args) override { return Status::OK(); }
+  Status Parse([[maybe_unused]] const std::vector<std::string> &args) override { return Status::OK(); }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute([[maybe_unused]] engine::Context &ctx, Server *srv, Connection *conn,
+                 [[maybe_unused]] std::string *output) override {
     int repl_fd = conn->GetFD();
     std::string ip = conn->GetAnnounceIP();
 
@@ -229,21 +232,21 @@ class CommandFetchMeta : public Commander {
       std::string files;
       auto s = engine::Storage::ReplDataManager::GetFullReplDataInfo(srv->storage, &files);
       if (!s.IsOK()) {
-        s = util::SockSend(repl_fd, "-ERR can't create db checkpoint", bev);
+        LOG(WARNING) << "[replication] Failed to get full data file info: " << s.Msg();
+        s = util::SockSend(repl_fd, redis::Error({Status::RedisErrorNoPrefix, "can't create db checkpoint"}), bev);
         if (!s.IsOK()) {
           LOG(WARNING) << "[replication] Failed to send error response: " << s.Msg();
         }
-        LOG(WARNING) << "[replication] Failed to get full data file info: " << s.Msg();
         return;
       }
       // Send full data file info
-      if (util::SockSend(repl_fd, files + CRLF, bev).IsOK()) {
+      if (auto s = util::SockSend(repl_fd, files + CRLF, bev)) {
         LOG(INFO) << "[replication] Succeed sending full data file info to " << ip;
       } else {
-        LOG(WARNING) << "[replication] Fail to send full data file info " << ip << ", error: " << strerror(errno);
+        LOG(WARNING) << "[replication] Fail to send full data file info " << ip << ", error: " << s.Msg();
       }
-      auto now = static_cast<time_t>(util::GetTimeStamp());
-      srv->storage->SetCheckpointAccessTime(now);
+      auto now_secs = static_cast<time_t>(util::GetTimeStamp());
+      srv->storage->SetCheckpointAccessTimeSecs(now_secs);
     }));
 
     if (auto s = util::ThreadDetach(t); !s) {
@@ -261,7 +264,8 @@ class CommandFetchFile : public Commander {
     return Status::OK();
   }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute([[maybe_unused]] engine::Context &ctx, Server *srv, Connection *conn,
+                 [[maybe_unused]] std::string *output) override {
     std::vector<std::string> files = util::Split(files_str_, ",");
 
     int repl_fd = conn->GetFD();
@@ -283,7 +287,7 @@ class CommandFetchFile : public Commander {
         if (srv->IsStopped()) break;
 
         uint64_t file_size = 0, max_replication_bytes = 0;
-        if (srv->GetConfig()->max_replication_mb > 0) {
+        if (srv->GetConfig()->max_replication_mb > 0 && srv->GetFetchFileThreadNum() != 0) {
           max_replication_bytes = (srv->GetConfig()->max_replication_mb * MiB) / srv->GetFetchFileThreadNum();
         }
         auto start = std::chrono::high_resolution_clock::now();
@@ -291,11 +295,14 @@ class CommandFetchFile : public Commander {
         if (!fd) break;
 
         // Send file size and content
-        if (util::SockSend(repl_fd, std::to_string(file_size) + CRLF, bev).IsOK() &&
-            util::SockSendFile(repl_fd, *fd, file_size, bev).IsOK()) {
+        auto s = util::SockSend(repl_fd, std::to_string(file_size) + CRLF, bev);
+        if (s) {
+          s = util::SockSendFile(repl_fd, *fd, file_size, bev);
+        }
+        if (s) {
           LOG(INFO) << "[replication] Succeed sending file " << file << " to " << ip;
         } else {
-          LOG(WARNING) << "[replication] Fail to send file " << file << " to " << ip << ", error: " << strerror(errno);
+          LOG(WARNING) << "[replication] Fail to send file " << file << " to " << ip << ", error: " << s.Msg();
           break;
         }
         fd.Close();
@@ -303,16 +310,18 @@ class CommandFetchFile : public Commander {
         // Sleep if the speed of sending file is more than replication speed limit
         auto end = std::chrono::high_resolution_clock::now();
         uint64_t duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-        auto shortest = static_cast<uint64_t>(static_cast<double>(file_size) /
-                                              static_cast<double>(max_replication_bytes) * (1000 * 1000));
-        if (max_replication_bytes > 0 && duration < shortest) {
-          LOG(INFO) << "[replication] Need to sleep " << (shortest - duration) / 1000
-                    << " ms since of sending files too quickly";
-          usleep(shortest - duration);
+        if (max_replication_bytes > 0) {
+          auto shortest = static_cast<uint64_t>(static_cast<double>(file_size) /
+                                                static_cast<double>(max_replication_bytes) * (1000 * 1000));
+          if (duration < shortest) {
+            LOG(INFO) << "[replication] Need to sleep " << (shortest - duration) / 1000
+                      << " ms since of sending files too quickly";
+            usleep(shortest - duration);
+          }
         }
       }
-      auto now = static_cast<time_t>(util::GetTimeStamp());
-      srv->storage->SetCheckpointAccessTime(now);
+      auto now_secs = util::GetTimeStamp<std::chrono::seconds>();
+      srv->storage->SetCheckpointAccessTimeSecs(now_secs);
       srv->DecrFetchFileThread();
     }));
 
@@ -329,20 +338,19 @@ class CommandFetchFile : public Commander {
 
 class CommandDBName : public Commander {
  public:
-  Status Parse(const std::vector<std::string> &args) override { return Status::OK(); }
+  Status Parse([[maybe_unused]] const std::vector<std::string> &args) override { return Status::OK(); }
 
-  Status Execute(Server *srv, Connection *conn, std::string *output) override {
+  Status Execute([[maybe_unused]] engine::Context &ctx, Server *srv, Connection *conn,
+                 [[maybe_unused]] std::string *output) override {
     conn->Reply(srv->storage->GetName() + CRLF);
     return Status::OK();
   }
 };
 
-REDIS_REGISTER_COMMANDS(MakeCmdAttr<CommandReplConf>("replconf", -3, "read-only replication no-script", 0, 0, 0),
-                        MakeCmdAttr<CommandPSync>("psync", -2, "read-only replication no-multi no-script", 0, 0, 0),
-                        MakeCmdAttr<CommandFetchMeta>("_fetch_meta", 1, "read-only replication no-multi no-script", 0,
-                                                      0, 0),
-                        MakeCmdAttr<CommandFetchFile>("_fetch_file", 2, "read-only replication no-multi no-script", 0,
-                                                      0, 0),
-                        MakeCmdAttr<CommandDBName>("_db_name", 1, "read-only replication no-multi", 0, 0, 0), )
+REDIS_REGISTER_COMMANDS(Replication, MakeCmdAttr<CommandReplConf>("replconf", -3, "read-only no-script", NO_KEY),
+                        MakeCmdAttr<CommandPSync>("psync", -2, "read-only no-multi no-script", NO_KEY),
+                        MakeCmdAttr<CommandFetchMeta>("_fetch_meta", 1, "read-only no-multi no-script", NO_KEY),
+                        MakeCmdAttr<CommandFetchFile>("_fetch_file", 2, "read-only no-multi no-script", NO_KEY),
+                        MakeCmdAttr<CommandDBName>("_db_name", 1, "read-only no-multi", NO_KEY), )
 
 }  // namespace redis

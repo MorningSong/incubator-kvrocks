@@ -22,13 +22,14 @@
 #include <rocksdb/iterator.h>
 #include <rocksdb/options.h>
 
+#include "cluster/cluster_defs.h"
 #include "storage.h"
 
 namespace engine {
 
 class SubKeyIterator {
  public:
-  explicit SubKeyIterator(Storage *storage, rocksdb::ReadOptions read_options, RedisType type, std::string prefix);
+  explicit SubKeyIterator(engine::Context &ctx, rocksdb::ReadOptions read_options, RedisType type, std::string prefix);
   ~SubKeyIterator() = default;
   bool Valid() const;
   void Seek();
@@ -37,6 +38,7 @@ class SubKeyIterator {
   Slice Key() const;
   // return the user key without prefix
   Slice UserKey() const;
+  rocksdb::ColumnFamilyHandle *ColumnFamilyHandle() const;
   Slice Value() const;
   void Reset();
 
@@ -51,7 +53,7 @@ class SubKeyIterator {
 
 class DBIterator {
  public:
-  explicit DBIterator(Storage *storage, rocksdb::ReadOptions read_options, int slot = -1);
+  explicit DBIterator(engine::Context &ctx, rocksdb::ReadOptions read_options, int slot = -1);
   ~DBIterator() = default;
 
   bool Valid() const;
@@ -71,12 +73,98 @@ class DBIterator {
 
   Storage *storage_;
   rocksdb::ReadOptions read_options_;
+  Context *ctx_;
   int slot_ = -1;
   Metadata metadata_ = Metadata(kRedisNone, false);
 
   rocksdb::ColumnFamilyHandle *metadata_cf_handle_ = nullptr;
   std::unique_ptr<rocksdb::Iterator> metadata_iter_;
   std::unique_ptr<SubKeyIterator> subkey_iter_;
+};
+
+struct WALItem {
+  enum class Type : uint8_t {
+    kTypeInvalid = 0,
+    kTypeLogData = 1,
+    kTypePut = 2,
+    kTypeDelete = 3,
+    kTypeDeleteRange = 4,
+  };
+
+  WALItem() = default;
+  WALItem(WALItem::Type t, uint32_t cf_id, std::string k, std::string v)
+      : type(t), column_family_id(cf_id), key(std::move(k)), value(std::move(v)) {}
+
+  WALItem::Type type = WALItem::Type::kTypeInvalid;
+  uint32_t column_family_id = 0;
+  std::string key;
+  std::string value;
+};
+
+class WALBatchExtractor : public rocksdb::WriteBatch::Handler {
+ public:
+  // If set slot, storage must enable slot id encoding
+  explicit WALBatchExtractor(int slot = -1) : slot_range_(slot, slot) {}
+  explicit WALBatchExtractor(const SlotRange &slot_range) : slot_range_(slot_range) {}
+
+  rocksdb::Status PutCF(uint32_t column_family_id, const Slice &key, const Slice &value) override;
+
+  rocksdb::Status DeleteCF(uint32_t column_family_id, const rocksdb::Slice &key) override;
+
+  rocksdb::Status DeleteRangeCF(uint32_t column_family_id, const rocksdb::Slice &begin_key,
+                                const rocksdb::Slice &end_key) override;
+
+  void LogData(const rocksdb::Slice &blob) override;
+
+  void Clear();
+
+  class Iter {
+    friend class WALBatchExtractor;
+
+   public:
+    bool Valid();
+    void Next();
+    WALItem Value();
+
+   private:
+    explicit Iter(std::vector<WALItem> *items) : items_(items), cur_(0) {}
+    std::vector<WALItem> *items_;
+    size_t cur_;
+  };
+
+  WALBatchExtractor::Iter GetIter();
+
+ private:
+  std::vector<WALItem> items_;
+  SlotRange slot_range_;
+};
+
+class WALIterator {
+ public:
+  explicit WALIterator(engine::Storage *storage, const SlotRange &slot_range)
+      : storage_(storage), slot_range_(slot_range), extractor_(slot_range), next_batch_seq_(0){};
+  explicit WALIterator(engine::Storage *storage, int slot = -1)
+      : storage_(storage), slot_range_(slot, slot), extractor_(slot), next_batch_seq_(0){};
+  ~WALIterator() = default;
+
+  bool Valid() const;
+  void Seek(rocksdb::SequenceNumber seq);
+  void Next();
+  WALItem Item();
+
+  rocksdb::SequenceNumber NextSequenceNumber() const;
+  void Reset();
+
+ private:
+  void nextBatch();
+
+  engine::Storage *storage_;
+  SlotRange slot_range_;
+
+  std::unique_ptr<rocksdb::TransactionLogIterator> iter_;
+  WALBatchExtractor extractor_;
+  std::unique_ptr<WALBatchExtractor::Iter> batch_iter_;
+  rocksdb::SequenceNumber next_batch_seq_;
 };
 
 }  // namespace engine

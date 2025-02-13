@@ -35,6 +35,22 @@ import (
 )
 
 func TestString(t *testing.T) {
+	configOptions := []util.ConfigOptions{
+		{
+			Name:       "txn-context-enabled",
+			Options:    []string{"yes", "no"},
+			ConfigType: util.YesNo,
+		},
+	}
+
+	configsMatrix, err := util.GenerateConfigsMatrix(configOptions)
+	require.NoError(t, err)
+
+	for _, configs := range configsMatrix {
+		testString(t, configs)
+	}
+}
+func testString(t *testing.T, configs util.KvrocksServerConfigs) {
 	srv := util.StartServer(t, map[string]string{})
 	defer srv.Close()
 	ctx := context.Background()
@@ -388,6 +404,12 @@ func TestString(t *testing.T) {
 		require.NoError(t, rdb.SetBit(ctx, "mykey", maxOffset, 1).Err())
 		require.EqualValues(t, 1, rdb.GetBit(ctx, "mykey", maxOffset).Val())
 		require.EqualValues(t, 1, rdb.BitCount(ctx, "mykey", &redis.BitCount{Start: 0, End: maxOffset / 8}).Val())
+		// Last byte should contain 1 bit.
+		require.EqualValues(t, 1, rdb.BitCount(ctx, "mykey", &redis.BitCount{Start: -1, End: -1}).Val())
+		// 0 - Last byte should contain 1 bit.
+		require.EqualValues(t, 1, rdb.BitCount(ctx, "mykey", &redis.BitCount{Start: -100, End: -1}).Val())
+		// The first byte shouldn't contain any bits
+		require.EqualValues(t, 0, rdb.BitCount(ctx, "mykey", &redis.BitCount{Start: -100, End: -100}).Val())
 		require.EqualValues(t, maxOffset, rdb.BitPos(ctx, "mykey", 1).Val())
 	})
 
@@ -476,6 +498,23 @@ func TestString(t *testing.T) {
 		require.NoError(t, rdb.Del(ctx, "mykey").Err())
 		require.NoError(t, rdb.LPush(ctx, "mykey", "foo").Err())
 		require.ErrorContains(t, rdb.SetRange(ctx, "mykey", 0, "bar").Err(), "WRONGTYPE")
+	})
+
+	t.Run("SETRANGE with negative offset", func(t *testing.T) {
+		require.ErrorContains(t, rdb.SetRange(ctx, "setrange_negative_offset", -1, "bar").Err(),
+			"value is not an integer or out of range")
+		require.ErrorContains(t, rdb.SetRange(ctx, "setrange_negative_offset", -2147483599, "bar").Err(),
+			"value is not an integer or out of range")
+	})
+
+	t.Run("SETRANGE with offset + value length too large", func(t *testing.T) {
+		protoMaxBulkLen := int64(1024 * 1024)
+		require.NoError(t, rdb.ConfigSet(ctx, "proto-max-bulk-len", strconv.FormatInt(protoMaxBulkLen, 10)).Err())
+		require.ErrorContains(t, rdb.SetRange(ctx, "setrange_out_of_range", protoMaxBulkLen, "world").Err(),
+			"string exceeds maximum allowed size")
+
+		// it should be able to set the value if the length is protoMaxBulkLen
+		require.NoError(t, rdb.SetRange(ctx, "setrange_out_of_range", protoMaxBulkLen-5, "world").Err())
 	})
 
 	t.Run("GETRANGE against non-existing key", func(t *testing.T) {
@@ -888,5 +927,109 @@ func TestString(t *testing.T) {
 
 		require.ErrorContains(t, rdb.Do(ctx, "CAD", "cad_key").Err(), "ERR wrong number of arguments")
 		require.ErrorContains(t, rdb.Do(ctx, "CAD", "cad_key", "123", "234").Err(), "ERR wrong number of arguments")
+	})
+
+	rna1 := "CACCTTCCCAGGTAACAAACCAACCAACTTTCGATCTCTTGTAGATCTGTTCTCTAAACGAACTTTAAAATCTGTGTGGCTGTCACTCGGCTGCATGCTTAGTGCACTCACGCAGTATAATTAATAACTAATTACTGTCGTTGACAGGACACGAGTAACTCGTCTATCTTCTGCAGGCTGCTTACGGTTTCGTCCGTGTTGCAGCCGATCATCAGCACATCTAGGTTTCGTCCGGGTGTG"
+	rna2 := "ATTAAAGGTTTATACCTTCCCAGGTAACAAACCAACCAACTTTCGATCTCTTGTAGATCTGTTCTCTAAACGAACTTTAAAATCTGTGTGGCTGTCACTCGGCTGCATGCTTAGTGCACTCACGCAGTATAATTAATAACTAATTACTGTCGTTGACAGGACACGAGTAACTCGTCTATCTTCTGCAGGCTGCTTACGGTTTCGTCCGTGTTGCAGCCGATCATCAGCACATCTAGGTTT"
+	rnalcs := "ACCTTCCCAGGTAACAAACCAACCAACTTTCGATCTCTTGTAGATCTGTTCTCTAAACGAACTTTAAAATCTGTGTGGCTGTCACTCGGCTGCATGCTTAGTGCACTCACGCAGTATAATTAATAACTAATTACTGTCGTTGACAGGACACGAGTAACTCGTCTATCTTCTGCAGGCTGCTTACGGTTTCGTCCGTGTTGCAGCCGATCATCAGCACATCTAGGTTT"
+
+	t.Run("LCS basic", func(t *testing.T) {
+		require.NoError(t, rdb.Set(ctx, "virus1", rna1, 0).Err())
+		require.NoError(t, rdb.Set(ctx, "virus2", rna2, 0).Err())
+		require.Equal(t, rnalcs, rdb.LCS(ctx, &redis.LCSQuery{Key1: "virus1", Key2: "virus2"}).Val().MatchString)
+	})
+
+	t.Run("LCS len", func(t *testing.T) {
+		require.NoError(t, rdb.Set(ctx, "virus1", rna1, 0).Err())
+		require.NoError(t, rdb.Set(ctx, "virus2", rna2, 0).Err())
+		require.Equal(t, int64(len(rnalcs)), rdb.LCS(ctx, &redis.LCSQuery{Key1: "virus1", Key2: "virus2", Len: true}).Val().Len)
+	})
+
+	t.Run("LCS indexes", func(t *testing.T) {
+		require.NoError(t, rdb.Set(ctx, "virus1", rna1, 0).Err())
+		require.NoError(t, rdb.Set(ctx, "virus2", rna2, 0).Err())
+		matches := rdb.LCS(ctx, &redis.LCSQuery{Key1: "virus1", Key2: "virus2", Idx: true}).Val().Matches
+		require.Equal(t, []redis.LCSMatchedPosition{
+			{
+				Key1: redis.LCSPosition{Start: 238, End: 238},
+				Key2: redis.LCSPosition{Start: 239, End: 239},
+			},
+			{
+				Key1: redis.LCSPosition{Start: 236, End: 236},
+				Key2: redis.LCSPosition{Start: 238, End: 238},
+			},
+			{
+				Key1: redis.LCSPosition{Start: 229, End: 230},
+				Key2: redis.LCSPosition{Start: 236, End: 237},
+			},
+			{
+				Key1: redis.LCSPosition{Start: 224, End: 224},
+				Key2: redis.LCSPosition{Start: 235, End: 235},
+			},
+			{
+				Key1: redis.LCSPosition{Start: 1, End: 222},
+				Key2: redis.LCSPosition{Start: 13, End: 234},
+			},
+		}, matches)
+	})
+
+	t.Run("LCS indexes with match len", func(t *testing.T) {
+		require.NoError(t, rdb.Set(ctx, "virus1", rna1, 0).Err())
+		require.NoError(t, rdb.Set(ctx, "virus2", rna2, 0).Err())
+		matches := rdb.LCS(ctx, &redis.LCSQuery{Key1: "virus1", Key2: "virus2", Idx: true, WithMatchLen: true}).Val().Matches
+		require.Equal(t, []redis.LCSMatchedPosition{
+			{
+				Key1:     redis.LCSPosition{Start: 238, End: 238},
+				Key2:     redis.LCSPosition{Start: 239, End: 239},
+				MatchLen: 1,
+			},
+			{
+				Key1:     redis.LCSPosition{Start: 236, End: 236},
+				Key2:     redis.LCSPosition{Start: 238, End: 238},
+				MatchLen: 1,
+			},
+			{
+				Key1:     redis.LCSPosition{Start: 229, End: 230},
+				Key2:     redis.LCSPosition{Start: 236, End: 237},
+				MatchLen: 2,
+			},
+			{
+				Key1:     redis.LCSPosition{Start: 224, End: 224},
+				Key2:     redis.LCSPosition{Start: 235, End: 235},
+				MatchLen: 1,
+			},
+			{
+				Key1:     redis.LCSPosition{Start: 1, End: 222},
+				Key2:     redis.LCSPosition{Start: 13, End: 234},
+				MatchLen: 222,
+			},
+		}, matches)
+	})
+
+	t.Run("LCS indexes with match len and minimum match len", func(t *testing.T) {
+		require.NoError(t, rdb.Set(ctx, "virus1", rna1, 0).Err())
+		require.NoError(t, rdb.Set(ctx, "virus2", rna2, 0).Err())
+		matches := rdb.LCS(ctx, &redis.LCSQuery{Key1: "virus1", Key2: "virus2", Idx: true, WithMatchLen: true, MinMatchLen: 5}).Val().Matches
+		require.Equal(t, []redis.LCSMatchedPosition{
+			{
+				Key1:     redis.LCSPosition{Start: 1, End: 222},
+				Key2:     redis.LCSPosition{Start: 13, End: 234},
+				MatchLen: 222,
+			},
+		}, matches)
+	})
+
+	t.Run("LCS empty", func(t *testing.T) {
+		require.NoError(t, rdb.Set(ctx, "virus1", rna1, 0).Err())
+		require.NoError(t, rdb.Set(ctx, "virus2", "", 0).Err())
+
+		require.Equal(t, rna1, rdb.LCS(ctx, &redis.LCSQuery{Key1: "virus1", Key2: "virus1"}).Val().MatchString)
+		require.Equal(t, "", rdb.LCS(ctx, &redis.LCSQuery{Key1: "virus1", Key2: "virus2"}).Val().MatchString)
+		require.Equal(t, "", rdb.LCS(ctx, &redis.LCSQuery{Key1: "virus2", Key2: "virus1"}).Val().MatchString)
+		require.Equal(t, "", rdb.LCS(ctx, &redis.LCSQuery{Key1: "virus2", Key2: "virus2"}).Val().MatchString)
+
+		require.Equal(t, int64(0), rdb.LCS(ctx, &redis.LCSQuery{Key1: "virus1", Key2: "virus2"}).Val().Len)
+		require.Equal(t, []redis.LCSMatchedPosition{}, rdb.LCS(ctx, &redis.LCSQuery{Key1: "virus1", Key2: "virus2", Idx: true}).Val().Matches)
+		require.Equal(t, []redis.LCSMatchedPosition{}, rdb.LCS(ctx, &redis.LCSQuery{Key1: "virus1", Key2: "virus2", Idx: true, WithMatchLen: true}).Val().Matches)
 	})
 }

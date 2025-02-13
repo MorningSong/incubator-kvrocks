@@ -24,8 +24,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/apache/kvrocks)](https://github.com/apache/kvrocks/stargazers)
 
 ---
-
-* [Slack Channel](https://join.slack.com/t/kvrockscommunity/shared_invite/zt-p5928e3r-OUAK8SUgC8GOceGM6dAz6w)
+* [Chat on Zulip](https://kvrocks.zulipchat.com/)
 * [Mailing List](https://lists.apache.org/list.html?dev@kvrocks.apache.org) ([how to subscribe](https://www.apache.org/foundation/mailinglists.html#subscribing))
 
 **Apache Kvrocks** is a distributed key value NoSQL database that uses RocksDB as storage engine and is compatible with Redis protocol. Kvrocks intends to decrease the cost of memory and increase the capacity while compared to Redis. The design of replication and storage was inspired by [rocksplicator](https://github.com/pinterest/rocksplicator) and [blackwidow](https://github.com/Qihoo360/blackwidow).
@@ -37,8 +36,6 @@ Kvrocks has the following key features:
 * Replication: Async replication using binlog like MySQL.
 * High Availability: Support Redis sentinel to failover when master or slave was failed.
 * Cluster: Centralized management but accessible via any Redis cluster client.
-
-Thanks to designers [Lingyu Tian](https://github.com/tianlingyu1997) and Shili Fan for contributing the logo of Kvrocks.
 
 ## Who uses Kvrocks
 
@@ -63,6 +60,12 @@ wget https://github.com/Kitware/CMake/releases/download/v3.26.4/cmake-3.26.4-lin
 sudo bash cmake.sh --skip-license --prefix=/usr
 # enable gcc and make in devtoolset-11
 source /opt/rh/devtoolset-11/enable
+
+# openSUSE / SUSE Linux Enterprise
+sudo zypper install -y gcc11 gcc11-c++ make wget git autoconf automake python3 curl cmake
+
+# Arch Linux
+sudo pacman -Sy --noconfirm autoconf automake python3 git wget which cmake make gcc
 
 # macOS
 brew install git cmake autoconf automake libtool openssl
@@ -93,6 +96,15 @@ To build with lua instead of luaJIT, run:
 $ ./x.py build -DENABLE_LUAJIT=OFF
 ```
 
+Build with debug mode, run:
+
+```shell
+# The default build type is RelWithDebInfo and its optimization level is typically -O2.
+# You can change it to -O0 in debug mode.
+
+$ ./x.py build -DCMAKE_BUILD_TYPE=Debug
+```
+
 ### Running Kvrocks
 
 ```shell
@@ -106,6 +118,8 @@ $ docker run -it -p 6666:6666 apache/kvrocks --bind 0.0.0.0
 # or get the nightly image:
 $ docker run -it -p 6666:6666 apache/kvrocks:nightly
 ```
+
+Please visit [Apache Kvrocks on DockerHub](https://hub.docker.com/r/apache/kvrocks) for additional details about images.
 
 ### Connect Kvrocks service
 
@@ -177,41 +191,6 @@ Documents are hosted at the [official website](https://kvrocks.apache.org/docs/g
 
 Kvrocks community welcomes all forms of contribution and you can find out how to get involved on the [Community](https://kvrocks.apache.org/community/) and [How to Contribute](https://kvrocks.apache.org/community/contributing) pages.
 
-## Performance
-
-### Hardware
-
-* CPU: 48 cores Intel(R) Xeon(R) CPU E5-2650 v4 @ 2.20GHz
-* Memory: 32 GiB
-* NET:  Intel Corporation I350 Gigabit Network Connection
-* DISK: 2TB NVMe Intel SSD DC P4600
-
-> Benchmark Client: multi-thread redis-benchmark(unstable branch)
-
-### 1. Commands QPS
-
-> kvrocks: workers = 16, benchmark: 8 threads/ 512 conns / 128 payload
-
-latency: 99.9% < 10ms
-
-![image](assets/chart-commands.png)
-
-### 2. QPS on different payloads
-
-> kvrocks: workers = 16, benchmark: 8 threads/ 512 conns
-
-latency: 99.9% < 10ms
-
-![image](assets/chart-values.png)
-
-### 3. QPS on different workers
-
-> kvrocks: workers = 16, benchmark: 8 threads/ 512 conns / 128 payload
-
-latency: 99.9% < 10ms
-
-![image](assets/chart-threads.png)
-
 ## License
 
 Apache Kvrocks is licensed under the Apache License Version 2.0. See the [LICENSE](LICENSE) file for details.
@@ -219,6 +198,7 @@ Apache Kvrocks is licensed under the Apache License Version 2.0. See the [LICENS
 ## Social Media
 
 - [Medium](https://kvrocks.medium.com/)
+- [X (Twitter)](https://twitter.com/apache_kvrocks)
 - [Zhihu](https://www.zhihu.com/people/kvrocks) (in Chinese)
 - WeChat Official Account (in Chinese, scan the QR code to follow)
 

@@ -33,7 +33,7 @@
 
 Status Parser::ParseFullDB() {
   rocksdb::DB *db = storage_->GetDB();
-  rocksdb::ColumnFamilyHandle *metadata_cf_handle = storage_->GetCFHandle(engine::kMetadataColumnFamilyName);
+  rocksdb::ColumnFamilyHandle *metadata_cf_handle = storage_->GetCFHandle(ColumnFamilyID::Metadata);
   // Due to RSI(Rocksdb Secondary Instance) not supporting "Snapshots based read", we don't need to set the snapshot
   // parameter. However, until we proactively invoke TryCatchUpWithPrimary, this replica is read-only, which can be
   // considered as a snapshot.
@@ -94,7 +94,8 @@ Status Parser::parseComplexKV(const Slice &ns_key, const Metadata &metadata) {
   read_options.iterate_upper_bound = &upper_bound;
 
   std::string output;
-  auto iter = util::UniqueIterator(storage_, read_options);
+  auto no_txn_ctx = engine::Context::NoTransactionContext(storage_);
+  auto iter = util::UniqueIterator(no_txn_ctx, read_options);
   for (iter->Seek(prefix_key); iter->Valid(); iter->Next()) {
     if (!iter->key().starts_with(prefix_key)) {
       break;
