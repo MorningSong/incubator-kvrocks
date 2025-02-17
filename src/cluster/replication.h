@@ -33,6 +33,7 @@
 
 #include "event_util.h"
 #include "io_util.h"
+#include "rocksdb/write_batch.h"
 #include "server/redis_connection.h"
 #include "status.h"
 #include "storage/storage.h"
@@ -95,10 +96,11 @@ class FeedSlaveThread {
 class ReplicationThread : private EventCallbackBase<ReplicationThread> {
  public:
   explicit ReplicationThread(std::string host, uint32_t port, Server *srv);
-  Status Start(std::function<void()> &&pre_fullsync_cb, std::function<void()> &&post_fullsync_cb);
+  Status Start(std::function<bool()> &&pre_fullsync_cb, std::function<void()> &&post_fullsync_cb);
   void Stop();
+  bool IsStopped() const { return stop_flag_; }
   ReplState State() { return repl_state_.load(std::memory_order_relaxed); }
-  time_t LastIOTime() { return last_io_time_.load(std::memory_order_relaxed); }
+  int64_t LastIOTimeSecs() const { return last_io_time_secs_.load(std::memory_order_relaxed); }
 
   void TimerCB(int, int16_t);
 
@@ -155,11 +157,11 @@ class ReplicationThread : private EventCallbackBase<ReplicationThread> {
   Server *srv_ = nullptr;
   engine::Storage *storage_ = nullptr;
   std::atomic<ReplState> repl_state_;
-  std::atomic<time_t> last_io_time_ = 0;
+  std::atomic<int64_t> last_io_time_secs_ = 0;
   bool next_try_old_psync_ = false;
   bool next_try_without_announce_ip_address_ = false;
 
-  std::function<void()> pre_fullsync_cb_;
+  std::function<bool()> pre_fullsync_cb_;
   std::function<void()> post_fullsync_cb_;
 
   // Internal states managed by FullSync procedure
@@ -204,11 +206,11 @@ class ReplicationThread : private EventCallbackBase<ReplicationThread> {
   Status fetchFiles(int sock_fd, const std::string &dir, const std::vector<std::string> &files,
                     const std::vector<uint32_t> &crcs, const FetchFileCallback &fn, ssl_st *ssl);
   Status parallelFetchFile(const std::string &dir, const std::vector<std::pair<std::string, uint32_t>> &files);
-  static bool isRestoringError(const char *err);
-  static bool isWrongPsyncNum(const char *err);
-  static bool isUnknownOption(const char *err);
+  static bool isRestoringError(std::string_view err);
+  static bool isWrongPsyncNum(std::string_view err);
+  static bool isUnknownOption(std::string_view err);
 
-  Status parseWriteBatch(const std::string &batch_string);
+  Status parseWriteBatch(const rocksdb::WriteBatch &write_batch);
 };
 
 /*
@@ -217,11 +219,13 @@ class ReplicationThread : private EventCallbackBase<ReplicationThread> {
 class WriteBatchHandler : public rocksdb::WriteBatch::Handler {
  public:
   rocksdb::Status PutCF(uint32_t column_family_id, const rocksdb::Slice &key, const rocksdb::Slice &value) override;
-  rocksdb::Status DeleteCF(uint32_t column_family_id, const rocksdb::Slice &key) override {
+  rocksdb::Status DeleteCF([[maybe_unused]] uint32_t column_family_id,
+                           [[maybe_unused]] const rocksdb::Slice &key) override {
     return rocksdb::Status::OK();
   }
-  rocksdb::Status DeleteRangeCF(uint32_t column_family_id, const rocksdb::Slice &begin_key,
-                                const rocksdb::Slice &end_key) override {
+  rocksdb::Status DeleteRangeCF([[maybe_unused]] uint32_t column_family_id,
+                                [[maybe_unused]] const rocksdb::Slice &begin_key,
+                                [[maybe_unused]] const rocksdb::Slice &end_key) override {
     return rocksdb::Status::OK();
   }
   WriteBatchType Type() { return type_; }

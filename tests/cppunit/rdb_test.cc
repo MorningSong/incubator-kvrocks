@@ -17,7 +17,7 @@
  * under the License.
  *
  */
-#include "storage/rdb.h"
+#include "storage/rdb/rdb.h"
 
 #include <cmath>
 #include <filesystem>
@@ -48,39 +48,38 @@ class RDBTest : public TestBase {
   ~RDBTest() override = default;
   void SetUp() override { crc64_init(); }
 
-  void TearDown() override { ASSERT_TRUE(clearDBDir(config_->db_dir)); }
+  void TearDown() override { ASSERT_TRUE(clearDBDir(config_.db_dir)); }
 
   void loadRdb(const std::string &path) {
     auto stream_ptr = std::make_unique<RdbFileStream>(path);
     auto s = stream_ptr->Open();
     ASSERT_TRUE(s.IsOK());
 
-    RDB rdb(storage_, ns_, std::move(stream_ptr));
-    s = rdb.LoadRdb(0);
+    RDB rdb(storage_.get(), ns_, std::move(stream_ptr));
+    s = rdb.LoadRdb(*ctx_, 0);
     ASSERT_TRUE(s.IsOK());
   }
 
   void stringCheck(const std::string &key, const std::string &expect) {
-    redis::String string_db(storage_, ns_);
+    redis::String string_db(storage_.get(), ns_);
     std::string value;
-    auto s = string_db.Get(key, &value);
+    auto s = string_db.Get(*ctx_, key, &value);
     ASSERT_TRUE(s.ok());
     ASSERT_TRUE(expect == value);
   }
 
   void setCheck(const std::string &key, const std::vector<std::string> &expect) {
-    redis::Set set_db(storage_, ns_);
+    redis::Set set_db(storage_.get(), ns_);
     std::vector<std::string> members;
-    auto s = set_db.Members(key, &members);
-
+    auto s = set_db.Members(*ctx_, key, &members);
     ASSERT_TRUE(s.ok());
     ASSERT_TRUE(expect == members);
   }
 
   void hashCheck(const std::string &key, const std::map<std::string, std::string> &expect) {
-    redis::Hash hash_db(storage_, ns_);
+    redis::Hash hash_db(storage_.get(), ns_);
     std::vector<FieldValue> field_values;
-    auto s = hash_db.GetAll(key, &field_values);
+    auto s = hash_db.GetAll(*ctx_, key, &field_values);
     ASSERT_TRUE(s.ok());
 
     // size check
@@ -95,19 +94,19 @@ class RDBTest : public TestBase {
   }
 
   void listCheck(const std::string &key, const std::vector<std::string> &expect) {
-    redis::List list_db(storage_, ns_);
+    redis::List list_db(storage_.get(), ns_);
     std::vector<std::string> values;
-    auto s = list_db.Range(key, 0, -1, &values);
+    auto s = list_db.Range(*ctx_, key, 0, -1, &values);
     ASSERT_TRUE(s.ok());
     ASSERT_TRUE(expect == values);
   }
 
   void zsetCheck(const std::string &key, const std::vector<MemberScore> &expect) {
-    redis::ZSet zset_db(storage_, ns_);
+    redis::ZSet zset_db(storage_.get(), ns_);
     std::vector<MemberScore> member_scores;
 
     RangeRankSpec spec;
-    auto s = zset_db.RangeByRank(key, spec, &member_scores, nullptr);
+    auto s = zset_db.RangeByRank(*ctx_, key, spec, &member_scores, nullptr);
     ASSERT_TRUE(s.ok());
     ASSERT_TRUE(expect.size() == member_scores.size());
     for (size_t i = 0; i < expect.size(); ++i) {
@@ -117,13 +116,13 @@ class RDBTest : public TestBase {
   }
 
   rocksdb::Status keyExist(const std::string &key) {
-    redis::Database redis(storage_, ns_);
-    return redis.KeyExist(key);
+    redis::Database redis(storage_.get(), ns_);
+    return redis.KeyExist(*ctx_, key);
   }
 
   void flushDB() {
-    redis::Database redis(storage_, ns_);
-    auto s = redis.FlushDB();
+    redis::Database redis(storage_.get(), ns_);
+    auto s = redis.FlushDB(*ctx_);
     ASSERT_TRUE(s.ok());
   }
 

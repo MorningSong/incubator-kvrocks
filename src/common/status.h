@@ -26,10 +26,10 @@
 #include <algorithm>
 #include <memory>
 #include <string>
-#include <tuple>
 #include <type_traits>
 #include <utility>
 
+#include "rocksdb/status.h"
 #include "type_util.h"
 
 class [[nodiscard]] Status {
@@ -37,35 +37,48 @@ class [[nodiscard]] Status {
   enum Code : unsigned char {
     NotOK = 1,
     NotFound,
+    NotSupported,
+    InvalidArgument,
 
     // DB
     DBOpenErr,
     DBBackupErr,
     DBGetWALErr,
-    DBBackupFileErr,
-
-    // Replication
-    DBMismatched,
 
     // Redis
     RedisUnknownCmd,
     RedisInvalidCmd,
     RedisParseErr,
     RedisExecErr,
-    RedisReplicationConflict,
+    RedisErrorNoPrefix,
+    RedisNoProto,
+    RedisLoading,
+    RedisMasterDown,
+    RedisNoScript,
+    RedisNoAuth,
+    RedisWrongType,
+    RedisReadOnly,
+    RedisExecAbort,
+    RedisBusyGroup,
+    RedisNoGroup,
+    RedisMoved,
+    RedisCrossSlot,
+    RedisTryAgain,
+    RedisClusterDown,
 
     // Cluster
-    ClusterDown,
     ClusterInvalidInfo,
-
-    // Slot
-    SlotImport,
-
-    // Network
-    NetSendErr,
 
     // Blocking
     BlockingCmd,
+
+    // Search
+    NoPrefixMatched,
+    TypeMismatched,
+
+    // IO
+    TryAgain,
+    EndOfFile,
   };
 
   Status() : impl_{nullptr} {}
@@ -361,10 +374,30 @@ struct [[nodiscard]] StatusOr {
   friend struct StatusOr;
 };
 
+template <typename T,
+          std::enable_if_t<IsStatusOr<RemoveCVRef<T>>::value || std::is_same_v<RemoveCVRef<T>, Status>, int> = 0>
+decltype(auto) StatusGetValue(T&& v) {
+  return std::forward<T>(v).GetValue();
+}
+
+template <typename T, std::enable_if_t<std::is_same_v<RemoveCVRef<T>, rocksdb::Status>, int> = 0>
+void StatusGetValue(T&&) {}
+
+template <typename T,
+          std::enable_if_t<IsStatusOr<RemoveCVRef<T>>::value || std::is_same_v<RemoveCVRef<T>, Status>, int> = 0>
+bool StatusIsOK(const T& v) {
+  return v.IsOK();
+}
+
+template <typename T, std::enable_if_t<std::is_same_v<RemoveCVRef<T>, rocksdb::Status>, int> = 0>
+bool StatusIsOK(const T& v) {
+  return v.ok();
+}
+
 // NOLINTNEXTLINE
-#define GET_OR_RET(...)                                         \
-  ({                                                            \
-    auto&& status = (__VA_ARGS__);                              \
-    if (!status) return std::forward<decltype(status)>(status); \
-    std::forward<decltype(status)>(status);                     \
-  }).GetValue()
+#define GET_OR_RET(...)                                                     \
+  StatusGetValue(({                                                         \
+    auto&& status = (__VA_ARGS__);                                          \
+    if (!StatusIsOK(status)) return std::forward<decltype(status)>(status); \
+    std::forward<decltype(status)>(status);                                 \
+  }))

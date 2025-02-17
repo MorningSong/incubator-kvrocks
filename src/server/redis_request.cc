@@ -36,10 +36,6 @@
 
 namespace redis {
 
-const size_t PROTO_INLINE_MAX_SIZE = 16 * 1024L;
-const size_t PROTO_BULK_MAX_SIZE = 512 * 1024L * 1024L;
-const size_t PROTO_MULTI_MAX_SIZE = 1024 * 1024L;
-
 Status Request::Tokenize(evbuffer *input) {
   size_t pipeline_size = 0;
 
@@ -112,7 +108,7 @@ Status Request::Tokenize(evbuffer *input) {
         }
 
         bulk_len_ = *parse_result;
-        if (bulk_len_ > PROTO_BULK_MAX_SIZE) {
+        if (bulk_len_ > srv_->GetConfig()->proto_max_bulk_len) {
           return {Status::NotOK, "Protocol error: invalid bulk length"};
         }
 

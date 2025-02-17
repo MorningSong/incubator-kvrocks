@@ -32,7 +32,67 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestClusterReplication(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	masterSrv := util.StartServer(t, map[string]string{"cluster-enabled": "yes"})
+	defer func() { masterSrv.Close() }()
+	masterClient := masterSrv.NewClient()
+	defer func() { require.NoError(t, masterClient.Close()) }()
+	masterNodeID := "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx00"
+	require.NoError(t, masterClient.Do(ctx, "clusterx", "SETNODEID", masterNodeID).Err())
+
+	replicaSrv := util.StartServer(t, map[string]string{
+		"cluster-enabled": "yes",
+		// enabled the replication namespace to reproduce the issue #2214
+		"repl-namespace-enabled": "yes",
+	})
+	defer func() { replicaSrv.Close() }()
+	replicaClient := replicaSrv.NewClient()
+	// allow to run the read-only command in the replica
+	require.NoError(t, replicaClient.ReadOnly(ctx).Err())
+	defer func() { require.NoError(t, replicaClient.Close()) }()
+	replicaNodeID := "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx01"
+	require.NoError(t, replicaClient.Do(ctx, "clusterx", "SETNODEID", replicaNodeID).Err())
+
+	clusterNodes := fmt.Sprintf("%s 127.0.0.1 %d master - 0-16383", masterNodeID, masterSrv.Port())
+	clusterNodes = fmt.Sprintf("%s\n%s 127.0.0.1 %d slave %s", clusterNodes, replicaNodeID, replicaSrv.Port(), masterNodeID)
+
+	require.NoError(t, masterClient.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
+	require.NoError(t, replicaClient.Do(ctx, "clusterx", "SETNODES", clusterNodes, "1").Err())
+
+	t.Run("Cluster replication should work", func(t *testing.T) {
+		util.WaitForSync(t, replicaClient)
+		require.Equal(t, "slave", util.FindInfoEntry(replicaClient, "role"))
+		masterClient.Set(ctx, "k0", "v0", 0)
+		masterClient.LPush(ctx, "k1", "e0", "e1", "e2")
+		util.WaitForOffsetSync(t, masterClient, replicaClient, 5*time.Second)
+
+		require.Equal(t, "v0", replicaClient.Get(ctx, "k0").Val())
+		require.Equal(t, []string{"e2", "e1", "e0"}, replicaClient.LRange(ctx, "k1", 0, -1).Val())
+	})
+
+	t.Run("Cluster replication should work normally after restart(issue #2214)", func(t *testing.T) {
+		replicaSrv.Close()
+		masterClient.Set(ctx, "k0", "v1", 0)
+		masterClient.HSet(ctx, "k2", "f0", "v0", "f1", "v1")
+
+		// start the replica server again
+		replicaSrv.Start()
+		_ = replicaClient.Close()
+		replicaClient = replicaSrv.NewClient()
+		// allow to run the read-only command in the replica
+		require.NoError(t, replicaClient.ReadOnly(ctx).Err())
+
+		util.WaitForOffsetSync(t, masterClient, replicaClient, 5*time.Second)
+		require.Equal(t, "v1", replicaClient.Get(ctx, "k0").Val())
+		require.Equal(t, map[string]string{"f0": "v0", "f1": "v1"}, replicaClient.HGetAll(ctx, "k2").Val())
+	})
+}
+
 func TestReplicationWithHostname(t *testing.T) {
+	t.Parallel()
 	srvA := util.StartServer(t, map[string]string{})
 	defer srvA.Close()
 	rdbA := srvA.NewClient()
@@ -58,6 +118,7 @@ func TestReplicationWithHostname(t *testing.T) {
 }
 
 func TestReplicationLoading(t *testing.T) {
+	t.Parallel()
 	srvA := util.StartServer(t, map[string]string{})
 	defer srvA.Close()
 	rdbA := srvA.NewClient()
@@ -92,6 +153,7 @@ func TestReplicationLoading(t *testing.T) {
 }
 
 func TestReplicationBasics(t *testing.T) {
+	t.Parallel()
 	master := util.StartServer(t, map[string]string{})
 	defer master.Close()
 	masterClient := master.NewClient()
@@ -123,7 +185,6 @@ func TestReplicationBasics(t *testing.T) {
 		util.SlaveOf(t, slaveClient, master)
 		require.Equal(t, "slave", util.FindInfoEntry(slaveClient, "role"))
 	})
-
 	util.WaitForSync(t, slaveClient)
 	t.Run("Sync should have transferred keys from master", func(t *testing.T) {
 		require.Equal(t, masterClient.Get(ctx, "mykey"), slaveClient.Get(ctx, "mykey"))
@@ -190,6 +251,7 @@ func TestReplicationBasics(t *testing.T) {
 }
 
 func TestReplicationWithMultiSlaves(t *testing.T) {
+	t.Parallel()
 	srvA := util.StartServer(t, map[string]string{})
 	defer srvA.Close()
 	rdbA := srvA.NewClient()
@@ -223,6 +285,7 @@ func TestReplicationWithMultiSlaves(t *testing.T) {
 }
 
 func TestReplicationWithLimitSpeed(t *testing.T) {
+	t.Parallel()
 	master := util.StartServer(t, map[string]string{
 		"max-replication-mb":            "1",
 		"rocksdb.compression":           "no",
@@ -272,6 +335,7 @@ func TestReplicationWithLimitSpeed(t *testing.T) {
 }
 
 func TestReplicationShareCheckpoint(t *testing.T) {
+	t.Parallel()
 	master := util.StartServer(t, map[string]string{})
 	defer master.Close()
 	masterClient := master.NewClient()
@@ -309,6 +373,7 @@ func TestReplicationShareCheckpoint(t *testing.T) {
 }
 
 func TestReplicationContinueRunning(t *testing.T) {
+	t.Parallel()
 	master := util.StartServer(t, map[string]string{})
 	defer master.Close()
 	masterClient := master.NewClient()
@@ -330,13 +395,14 @@ func TestReplicationContinueRunning(t *testing.T) {
 			"0": 0, "1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9,
 			"a": "a", "b": "b", "c": "c", "d": "d", "e": "e", "f": "f", "g": "g", "h": "h", "i": "i", "j": "j", "k": "k"})
 		require.EqualValues(t, 21, masterClient.HLen(ctx, "myhash").Val())
-		util.WaitForOffsetSync(t, masterClient, slaveClient)
+		util.WaitForOffsetSync(t, masterClient, slaveClient, 5*time.Second)
 		require.Equal(t, "1", slaveClient.HGet(ctx, "myhash", "1").Val())
 		require.Equal(t, "a", slaveClient.HGet(ctx, "myhash", "a").Val())
 	})
 }
 
 func TestReplicationChangePassword(t *testing.T) {
+	t.Parallel()
 	master := util.StartServer(t, map[string]string{})
 	defer master.Close()
 	masterClient := master.NewClient()
@@ -379,6 +445,7 @@ func TestReplicationChangePassword(t *testing.T) {
 }
 
 func TestReplicationAnnounceIP(t *testing.T) {
+	t.Parallel()
 	master := util.StartServer(t, map[string]string{})
 	defer master.Close()
 	masterClient := master.NewClient()
@@ -424,6 +491,7 @@ func TestReplicationAnnounceIP(t *testing.T) {
 }
 
 func TestShouldNotReplicate(t *testing.T) {
+	t.Parallel()
 	master := util.StartServer(t, map[string]string{})
 	defer master.Close()
 	masterClient := master.NewClient()
@@ -450,4 +518,107 @@ func TestShouldNotReplicate(t *testing.T) {
 		require.EqualErrorf(t, err, "ERR can't replicate your own replicas", err.Error())
 		require.Equal(t, "master", util.FindInfoEntry(masterClient, "role"))
 	})
+}
+
+func TestFullSyncReplication(t *testing.T) {
+	t.Parallel()
+	master := util.StartServer(t, map[string]string{
+		"rocksdb.write_buffer_size":       "4",
+		"rocksdb.target_file_size_base":   "16",
+		"rocksdb.max_write_buffer_number": "1",
+		"rocksdb.wal_ttl_seconds":         "0",
+		"rocksdb.wal_size_limit_mb":       "0",
+	})
+	defer master.Close()
+	masterClient := master.NewClient()
+	defer func() { require.NoError(t, masterClient.Close()) }()
+
+	slave := util.StartServer(t, map[string]string{})
+	defer slave.Close()
+	slaveClient := slave.NewClient()
+	defer func() { require.NoError(t, slaveClient.Close()) }()
+
+	ctx := context.Background()
+
+	t.Run("Full sync replication should work correctly", func(t *testing.T) {
+		value := strings.Repeat("a", 128*1024)
+		for i := 0; i < 1024; i++ {
+			require.NoError(t, masterClient.Set(ctx, fmt.Sprintf("key%d", i), value, 0).Err())
+		}
+
+		util.SlaveOf(t, slaveClient, master)
+		// Wait more time for full sync to avoid flake test in CI environment
+		util.WaitForOffsetSync(t, masterClient, slaveClient, 60*time.Second)
+
+		// Make sure the full sync happened in replication
+		syncFullCount, err := strconv.Atoi(util.FindInfoEntry(masterClient, "sync_full"))
+		require.NoError(t, err)
+		require.Greater(t, syncFullCount, 0)
+
+		got, err := slaveClient.Get(ctx, "key1").Result()
+		require.NoError(t, err)
+		require.Equal(t, value, got)
+
+		require.NoError(t, masterClient.Set(ctx, "foo", "bar", 0).Err())
+		util.WaitForOffsetSync(t, masterClient, slaveClient, 5*time.Second)
+		require.Equal(t, "bar", slaveClient.Get(ctx, "foo").Val())
+	})
+}
+
+func TestSlaveLostMaster(t *testing.T) {
+	t.Parallel()
+	// integration test for #2662 and #2671
+	ctx := context.Background()
+
+	masterSrv := util.StartServer(t, map[string]string{
+		"cluster-enabled":               "yes",
+		"max-replication-mb":            "1",
+		"rocksdb.compression":           "no",
+		"rocksdb.write_buffer_size":     "1",
+		"rocksdb.target_file_size_base": "1",
+	})
+	defer func() { masterSrv.Close() }()
+	masterClient := masterSrv.NewClient()
+	defer func() { require.NoError(t, masterClient.Close()) }()
+	masterNodeID := "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx00"
+	require.NoError(t, masterClient.Do(ctx, "clusterx", "SETNODEID", masterNodeID).Err())
+
+	replicaSrv := util.StartServer(t, map[string]string{
+		"cluster-enabled":                "yes",
+		"replication-connect-timeout-ms": "5000",
+		"replication-recv-timeout-ms":    "5100",
+	})
+	defer func() { replicaSrv.Close() }()
+	replicaClient := replicaSrv.NewClient()
+	// allow to run the read-only command in the replica
+	require.NoError(t, replicaClient.ReadOnly(ctx).Err())
+	defer func() { require.NoError(t, replicaClient.Close()) }()
+	replicaNodeID := "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx01"
+	require.NoError(t, replicaClient.Do(ctx, "clusterx", "SETNODEID", replicaNodeID).Err())
+
+	proxyCtx, cancelProxy := context.WithCancel(ctx)
+	newMasterPort := util.SimpleTCPProxy(proxyCtx, t, fmt.Sprintf("127.0.0.1:%d", masterSrv.Port()), true)
+
+	masterNodesInfo := fmt.Sprintf("%s 127.0.0.1 %d master - 0-16383\n%s 127.0.0.1 %d slave %s",
+		masterNodeID, masterSrv.Port(), replicaNodeID, replicaSrv.Port(), masterNodeID)
+	clusterNodesInfo := fmt.Sprintf("%s 127.0.0.1 %d master - 0-16383\n%s 127.0.0.1 %d slave %s",
+		masterNodeID, newMasterPort, replicaNodeID, replicaSrv.Port(), masterNodeID)
+	unexistNodesInfo := fmt.Sprintf("%s 127.0.0.2 %d master - 0-16383\n%s 127.0.0.1 %d slave %s",
+		masterNodeID, newMasterPort, replicaNodeID, replicaSrv.Port(), masterNodeID)
+
+	require.NoError(t, masterClient.Do(ctx, "clusterx", "SETNODES", masterNodesInfo, "1").Err())
+	value := strings.Repeat("a", 128*1024)
+
+	for i := 0; i < 1024; i++ {
+		require.NoError(t, masterClient.Set(ctx, fmt.Sprintf("key%d", i), value, 0).Err())
+	}
+
+	require.NoError(t, replicaClient.Do(ctx, "clusterx", "SETNODES", clusterNodesInfo, "1").Err())
+
+	time.Sleep(2 * time.Second)
+	cancelProxy()
+	start := time.Now()
+	require.NoError(t, replicaClient.Do(ctx, "clusterx", "SETNODES", unexistNodesInfo, "2").Err())
+	duration := time.Since(start)
+	require.Less(t, duration, time.Second*6)
 }

@@ -31,7 +31,6 @@ import (
 	"github.com/apache/kvrocks/tests/gocase/util"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
-	"modernc.org/mathutil"
 )
 
 // We need a value larger than list-max-ziplist-value to make sure
@@ -42,9 +41,24 @@ var largeValue = map[string]string{
 }
 
 func TestLTRIM(t *testing.T) {
-	srv := util.StartServer(t, map[string]string{
-		"list-max-ziplist-size": "4",
-	})
+	configOptions := []util.ConfigOptions{
+		{
+			Name:       "txn-context-enabled",
+			Options:    []string{"yes", "no"},
+			ConfigType: util.YesNo,
+		},
+	}
+
+	configsMatrix, err := util.GenerateConfigsMatrix(configOptions)
+	require.NoError(t, err)
+
+	for _, configs := range configsMatrix {
+		testLTRIM(t, configs)
+	}
+}
+
+func testLTRIM(t *testing.T, configs util.KvrocksServerConfigs) {
+	srv := util.StartServer(t, configs)
 	defer srv.Close()
 	ctx := context.Background()
 	rdb := srv.NewClient()
@@ -53,7 +67,6 @@ func TestLTRIM(t *testing.T) {
 	key := "myList"
 	startLen := int64(32)
 
-	rand.Seed(0)
 	for typ, value := range largeValue {
 		t.Run(fmt.Sprintf("LTRIM stress testing - %s", typ), func(t *testing.T) {
 			var myList []string
@@ -71,7 +84,7 @@ func TestLTRIM(t *testing.T) {
 				lo := int64(rand.Float64() * float64(startLen))
 				hi := int64(float64(lo) + rand.Float64()*float64(startLen))
 
-				myList = myList[lo:mathutil.Min(int(hi+1), len(myList))]
+				myList = myList[lo:min(int(hi+1), len(myList))]
 				require.NoError(t, rdb.LTrim(ctx, key, lo, hi).Err())
 				require.Equal(t, myList, rdb.LRange(ctx, key, 0, -1).Val(), "failed trim")
 
@@ -88,9 +101,24 @@ func TestLTRIM(t *testing.T) {
 }
 
 func TestZipList(t *testing.T) {
-	srv := util.StartServer(t, map[string]string{
-		"list-max-ziplist-size": "16",
-	})
+	configOptions := []util.ConfigOptions{
+		{
+			Name:       "txn-context-enabled",
+			Options:    []string{"yes", "no"},
+			ConfigType: util.YesNo,
+		},
+	}
+
+	configsMatrix, err := util.GenerateConfigsMatrix(configOptions)
+	require.NoError(t, err)
+
+	for _, configs := range configsMatrix {
+		testZipList(t, configs)
+	}
+}
+
+func testZipList(t *testing.T, configs util.KvrocksServerConfigs) {
+	srv := util.StartServer(t, configs)
 	defer srv.Close()
 	ctx := context.Background()
 	rdb := srv.NewClientWithOption(&redis.Options{
@@ -98,8 +126,6 @@ func TestZipList(t *testing.T) {
 		MaxRetries:  -1, // disable retry
 	})
 	defer func() { require.NoError(t, rdb.Close()) }()
-
-	rand.Seed(0)
 
 	t.Run("Explicit regression for a list bug", func(t *testing.T) {
 		key := "l"
@@ -240,7 +266,29 @@ func TestZipList(t *testing.T) {
 }
 
 func TestList(t *testing.T) {
-	srv := util.StartServer(t, map[string]string{})
+	configOptions := []util.ConfigOptions{
+		{
+			Name:       "txn-context-enabled",
+			Options:    []string{"yes", "no"},
+			ConfigType: util.YesNo,
+		},
+		{
+			Name:       "resp3-enabled",
+			Options:    []string{"yes", "no"},
+			ConfigType: util.YesNo,
+		},
+	}
+
+	configsMatrix, err := util.GenerateConfigsMatrix(configOptions)
+	require.NoError(t, err)
+
+	for _, configs := range configsMatrix {
+		testList(t, configs)
+	}
+}
+
+func testList(t *testing.T, configs util.KvrocksServerConfigs) {
+	srv := util.StartServer(t, configs)
 	defer srv.Close()
 	ctx := context.Background()
 	rdb := srv.NewClient()
@@ -392,11 +440,8 @@ func TestList(t *testing.T) {
 		rd := srv.NewTCPClient()
 		defer func() { require.NoError(t, rd.Close()) }()
 		require.NoError(t, rdb.Del(ctx, "blist", "target").Err())
-		time.Sleep(time.Millisecond * 100)
 		require.NoError(t, rd.WriteArgs("blpop", "blist", "0"))
-		time.Sleep(time.Millisecond * 100)
 		require.EqualValues(t, 2, rdb.LPush(ctx, "blist", "foo", "bar").Val())
-		time.Sleep(time.Millisecond * 100)
 		rd.MustReadStrings(t, []string{"blist", "bar"})
 		require.Equal(t, "foo", rdb.LRange(ctx, "blist", 0, -1).Val()[0])
 	})
@@ -406,7 +451,7 @@ func TestList(t *testing.T) {
 			rd := srv.NewTCPClient()
 			defer func() { require.NoError(t, rd.Close()) }()
 			require.NoError(t, rdb.Del(ctx, "blist1").Err())
-			require.NoError(t, rd.WriteArgs(popType, "blist1", "1"))
+			require.NoError(t, rd.WriteArgs(popType, "blist1", "0"))
 			require.NoError(t, rdb.RPush(ctx, "blist1", "foo").Err())
 			rd.MustReadStrings(t, []string{"blist1", "foo"})
 			require.EqualValues(t, 0, rdb.Exists(ctx, "blist1").Val())
@@ -425,7 +470,6 @@ func TestList(t *testing.T) {
 			rd := srv.NewTCPClient()
 			defer func() { require.NoError(t, rd.Close()) }()
 			require.NoError(t, rd.WriteArgs(popType, "blist1", "0"))
-			time.Sleep(time.Millisecond * 1000)
 			require.NoError(t, rdb.RPush(ctx, "blist1", "foo").Err())
 			rd.MustReadStrings(t, []string{"blist1", "foo"})
 		})
@@ -732,10 +776,10 @@ func TestList(t *testing.T) {
 	})
 
 	for listType, large := range largeValue {
-		trimList := func(listType string, min, max int64) []string {
+		trimList := func(listType string, minInt, maxInt int64) []string {
 			require.NoError(t, rdb.Del(ctx, "mylist").Err())
 			createList("mylist", []string{"1", "2", "3", "4", large})
-			require.NoError(t, rdb.LTrim(ctx, "mylist", min, max).Err())
+			require.NoError(t, rdb.LTrim(ctx, "mylist", minInt, maxInt).Err())
 			return rdb.LRange(ctx, "mylist", 0, -1).Val()
 		}
 
@@ -1345,9 +1389,7 @@ func TestList(t *testing.T) {
 			defer func() { require.NoError(t, rd.Close()) }()
 			require.NoError(t, rdb.Del(ctx, key1, key2).Err())
 			require.NoError(t, rd.WriteArgs("blmpop", "1", "1", key1, direction, "count", "1"))
-			time.Sleep(time.Millisecond * 100)
 			require.NoError(t, rdb.RPush(ctx, key1, "ONE", "TWO").Err())
-			time.Sleep(time.Millisecond * 100)
 			if direction == "LEFT" {
 				rd.MustReadStringsWithKey(t, key1, []string{"ONE"})
 			} else {
@@ -1361,9 +1403,7 @@ func TestList(t *testing.T) {
 			defer func() { require.NoError(t, rd.Close()) }()
 			require.NoError(t, rdb.Del(ctx, key1, key2).Err())
 			require.NoError(t, rd.WriteArgs("blmpop", "1", "1", key1, direction, "count", "2"))
-			time.Sleep(time.Millisecond * 100)
 			require.NoError(t, rdb.RPush(ctx, key1, "ONE", "TWO").Err())
-			time.Sleep(time.Millisecond * 100)
 			if direction == "LEFT" {
 				rd.MustReadStringsWithKey(t, key1, []string{"ONE", "TWO"})
 			} else {
@@ -1377,9 +1417,7 @@ func TestList(t *testing.T) {
 			defer func() { require.NoError(t, rd.Close()) }()
 			require.NoError(t, rdb.Del(ctx, key1, key2).Err())
 			require.NoError(t, rd.WriteArgs("blmpop", "1", "1", key1, direction, "count", "10"))
-			time.Sleep(time.Millisecond * 100)
 			require.NoError(t, rdb.RPush(ctx, key1, "ONE", "TWO").Err())
-			time.Sleep(time.Millisecond * 100)
 			if direction == "LEFT" {
 				rd.MustReadStringsWithKey(t, key1, []string{"ONE", "TWO"})
 			} else {
@@ -1393,9 +1431,7 @@ func TestList(t *testing.T) {
 			defer func() { require.NoError(t, rd.Close()) }()
 			require.NoError(t, rdb.Del(ctx, key1, key2).Err())
 			require.NoError(t, rd.WriteArgs("blmpop", "1", "2", key1, key2, direction, "count", "2"))
-			time.Sleep(time.Millisecond * 100)
 			require.NoError(t, rdb.RPush(ctx, key1, "ONE", "TWO").Err())
-			time.Sleep(time.Millisecond * 100)
 			if direction == "LEFT" {
 				rd.MustReadStringsWithKey(t, key1, []string{"ONE", "TWO"})
 			} else {
@@ -1409,9 +1445,7 @@ func TestList(t *testing.T) {
 			defer func() { require.NoError(t, rd.Close()) }()
 			require.NoError(t, rdb.Del(ctx, key1, key2).Err())
 			require.NoError(t, rd.WriteArgs("blmpop", "1", "2", key1, key2, direction, "count", "2"))
-			time.Sleep(time.Millisecond * 100)
 			require.NoError(t, rdb.RPush(ctx, key2, "one", "two").Err())
-			time.Sleep(time.Millisecond * 100)
 			if direction == "LEFT" {
 				rd.MustReadStringsWithKey(t, key2, []string{"one", "two"})
 			} else {
@@ -1425,18 +1459,19 @@ func TestList(t *testing.T) {
 			defer func() { require.NoError(t, rd.Close()) }()
 			require.NoError(t, rdb.Del(ctx, key1, key2).Err())
 			require.NoError(t, rd.WriteArgs("blmpop", "1", "2", key1, key2, direction, "count", "2"))
-			time.Sleep(time.Millisecond * 100)
-			require.NoError(t, rdb.RPush(ctx, key2, "one", "two").Err())
-			time.Sleep(time.Millisecond * 100)
+			// https://github.com/apache/kvrocks/issues/2617
+			// WriteArgs are required to be executed first
+			time.Sleep(100 * time.Millisecond)
+
 			require.NoError(t, rdb.RPush(ctx, key1, "ONE", "TWO").Err())
-			time.Sleep(time.Millisecond * 100)
+			require.NoError(t, rdb.RPush(ctx, key2, "one", "two").Err())
 			if direction == "LEFT" {
-				rd.MustReadStringsWithKey(t, key2, []string{"one", "two"})
+				rd.MustReadStringsWithKey(t, key1, []string{"ONE", "TWO"})
 			} else {
-				rd.MustReadStringsWithKey(t, key2, []string{"two", "one"})
+				rd.MustReadStringsWithKey(t, key1, []string{"TWO", "ONE"})
 			}
-			require.EqualValues(t, 0, rdb.Exists(ctx, key2).Val())
-			require.EqualValues(t, 2, rdb.LLen(ctx, key1).Val())
+			require.EqualValues(t, 0, rdb.Exists(ctx, key1).Val())
+			require.EqualValues(t, 2, rdb.LLen(ctx, key2).Val())
 		})
 
 		t.Run(fmt.Sprintf("BLMPOP test blocked served secondKey noCount %s", direction), func(t *testing.T) {
@@ -1444,9 +1479,7 @@ func TestList(t *testing.T) {
 			defer func() { require.NoError(t, rd.Close()) }()
 			require.NoError(t, rdb.Del(ctx, key1, key2).Err())
 			require.NoError(t, rd.WriteArgs("blmpop", "1", "2", key1, key2, direction))
-			time.Sleep(time.Millisecond * 100)
 			require.NoError(t, rdb.RPush(ctx, key2, "one", "two").Err())
-			time.Sleep(time.Millisecond * 100)
 			if direction == "LEFT" {
 				rd.MustReadStringsWithKey(t, key2, []string{"one"})
 			} else {
@@ -1461,7 +1494,6 @@ func TestList(t *testing.T) {
 			defer func() { require.NoError(t, rd.Close()) }()
 			require.NoError(t, rdb.Del(ctx, key1, key2).Err())
 			require.NoError(t, rd.WriteArgs("blmpop", "1", "2", key1, key2, direction))
-			time.Sleep(time.Millisecond * 1200)
 			rd.MustMatch(t, "")
 		})
 
@@ -1471,9 +1503,7 @@ func TestList(t *testing.T) {
 			defer func() { require.NoError(t, rd.Close()) }()
 			require.NoError(t, rdb.Del(ctx, key1, key2).Err())
 			require.NoError(t, rd.WriteArgs("blmpop", "0", "2", key1, key2, direction, "count", "2"))
-			time.Sleep(time.Millisecond * 1200)
 			require.NoError(t, rdb.RPush(ctx, key2, "one", "two").Err())
-			time.Sleep(time.Millisecond * 100)
 			if direction == "LEFT" {
 				rd.MustReadStringsWithKey(t, key2, []string{"one", "two"})
 			} else {

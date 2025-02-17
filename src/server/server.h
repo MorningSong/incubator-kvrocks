@@ -33,6 +33,7 @@
 #include <set>
 #include <shared_mutex>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -44,6 +45,8 @@
 #include "commands/commander.h"
 #include "lua.hpp"
 #include "namespace.h"
+#include "search/index_manager.h"
+#include "search/indexer.h"
 #include "server/redis_connection.h"
 #include "stats/log_collector.h"
 #include "stats/stats.h"
@@ -53,8 +56,11 @@
 #include "tls_util.h"
 #include "worker.h"
 
+constexpr const char *REDIS_VERSION = "4.0.0";
+
 struct DBScanInfo {
-  time_t last_scan_time = 0;
+  // Last scan system clock in seconds
+  int64_t last_scan_time_secs = 0;
   KeyNumStats key_num_stats;
   bool is_scanning = false;
 };
@@ -137,6 +143,13 @@ enum ClientType {
 
 enum ServerLogType { kServerLogNone, kReplIdLog };
 
+enum class AuthResult {
+  IS_USER,
+  IS_ADMIN,
+  INVALID_PASSWORD,
+  NO_REQUIRE_PASS,
+};
+
 class ServerLogData {
  public:
   // Redis::WriteBatchLogData always starts with digit ascii, we use alphabetic to
@@ -177,7 +190,7 @@ class Server {
   bool IsStopped() const { return stop_; }
   bool IsLoading() const { return is_loading_; }
   Config *GetConfig() { return config_; }
-  static Status LookupAndCreateCommand(const std::string &cmd_name, std::unique_ptr<redis::Commander> *cmd);
+  static StatusOr<std::unique_ptr<redis::Commander>> LookupAndCreateCommand(const std::string &cmd_name);
   void AdjustOpenFilesLimit();
   void AdjustWorkerThreads();
 
@@ -220,27 +233,45 @@ class Server {
 
   static int64_t GetCachedUnixTime();
   int64_t GetLastBgsaveTime();
-  void GetStatsInfo(std::string *info);
-  void GetServerInfo(std::string *info);
-  void GetMemoryInfo(std::string *info);
-  void GetRocksDBInfo(std::string *info);
-  void GetClientsInfo(std::string *info);
-  void GetReplicationInfo(std::string *info);
-  void GetRoleInfo(std::string *info);
-  void GetCommandsStatsInfo(std::string *info);
-  void GetClusterInfo(std::string *info);
-  void GetInfo(const std::string &ns, const std::string &section, std::string *info);
+  std::string GetRoleInfo();
+
+  struct InfoEntry {
+    std::string name;
+    std::string val;
+
+    InfoEntry(std::string name, std::string val) : name(std::move(name)), val(std::move(val)) {}
+    InfoEntry(std::string name, std::string_view val) : name(std::move(name)), val(val.begin(), val.end()) {}
+    InfoEntry(std::string name, const char *val) : name(std::move(name)), val(val) {}
+    template <typename T, std::enable_if_t<std::is_integral_v<T> || std::is_floating_point_v<T>, int> = 0>
+    InfoEntry(std::string name, T v) : name(std::move(name)), val(std::to_string(v)) {}
+  };
+  using InfoEntries = std::vector<InfoEntry>;
+
+  InfoEntries GetStatsInfo();
+  InfoEntries GetServerInfo();
+  InfoEntries GetMemoryInfo();
+  InfoEntries GetRocksDBInfo();
+  InfoEntries GetClientsInfo();
+  InfoEntries GetReplicationInfo();
+  InfoEntries GetCommandsStatsInfo();
+  InfoEntries GetClusterInfo();
+  InfoEntries GetPersistenceInfo();
+  InfoEntries GetCpuInfo();
+  InfoEntries GetKeyspaceInfo(const std::string &ns);
+
+  std::string GetInfo(const std::string &ns, const std::vector<std::string> &sections);
   std::string GetRocksDBStatsJson() const;
   ReplState GetReplicationState();
 
-  void PrepareRestoreDB();
+  bool PrepareRestoreDB();
   void WaitNoMigrateProcessing();
   Status AsyncCompactDB(const std::string &begin_key = "", const std::string &end_key = "");
   Status AsyncBgSaveDB();
   Status AsyncPurgeOldBackups(uint32_t num_backups_to_keep, uint32_t backup_max_keep_hours);
   Status AsyncScanDBSize(const std::string &ns);
   void GetLatestKeyNumStats(const std::string &ns, KeyNumStats *stats);
-  time_t GetLastScanTime(const std::string &ns);
+  int64_t GetLastScanTime(const std::string &ns) const;
+  StatusOr<std::vector<rocksdb::BatchResult>> PollUpdates(uint64_t next_sequence, int64_t count, bool is_strict) const;
 
   std::string GenerateCursorFromKeyName(const std::string &key_name, CursorType cursor_type, const char *prefix = "");
   std::string GetKeyNameFromCursor(const std::string &cursor, CursorType cursor_type);
@@ -256,8 +287,7 @@ class Server {
   void KillClient(int64_t *killed, const std::string &addr, uint64_t id, uint64_t type, bool skipme,
                   redis::Connection *conn);
 
-  lua_State *Lua() { return lua_; }
-  Status ScriptExists(const std::string &sha);
+  Status ScriptExists(const std::string &sha) const;
   Status ScriptGet(const std::string &sha, std::string *body) const;
   Status ScriptSet(const std::string &sha, const std::string &body) const;
   void ScriptReset();
@@ -272,9 +302,6 @@ class Server {
   Status ExecPropagatedCommand(const std::vector<std::string> &tokens);
   Status ExecPropagateScriptCommand(const std::vector<std::string> &tokens);
 
-  void SetCurrentConnection(redis::Connection *conn) { curr_connection_ = conn; }
-  redis::Connection *GetCurrentConnection() { return curr_connection_; }
-
   LogCollector<PerfEntry> *GetPerfLog() { return &perf_log_; }
   LogCollector<SlowEntry> *GetSlowLog() { return &slow_log_; }
   void SlowlogPushEntryIfNeeded(const std::vector<std::string> *args, uint64_t duration, const redis::Connection *conn);
@@ -285,7 +312,7 @@ class Server {
   Stats stats;
   engine::Storage *storage;
   std::unique_ptr<Cluster> cluster;
-  static inline std::atomic<int64_t> unix_time = 0;
+  static inline std::atomic<int64_t> unix_time_secs = 0;
   std::unique_ptr<SlotMigrator> slot_migrator;
   std::unique_ptr<SlotImport> slot_import;
 
@@ -297,9 +324,15 @@ class Server {
   std::list<std::pair<std::string, uint32_t>> GetSlaveHostAndPort();
   Namespace *GetNamespace() { return &namespace_; }
 
+  AuthResult AuthenticateUser(const std::string &user_password, std::string *ns);
+
 #ifdef ENABLE_OPENSSL
   UniqueSSLContext ssl_ctx;
 #endif
+
+  // search
+  redis::GlobalIndexer indexer;
+  redis::IndexManager index_mgr;
 
  private:
   void cron();
@@ -314,17 +347,13 @@ class Server {
 
   std::atomic<bool> stop_ = false;
   std::atomic<bool> is_loading_ = false;
-  int64_t start_time_;
+  int64_t start_time_secs_;
   std::mutex slaveof_mu_;
   std::string master_host_;
   uint32_t master_port_ = 0;
   Config *config_ = nullptr;
   std::string last_random_key_cursor_;
   std::mutex last_random_key_cursor_mu_;
-
-  std::atomic<lua_State *> lua_;
-
-  redis::Connection *curr_connection_ = nullptr;
 
   // client counters
   std::atomic<uint64_t> client_id_{1};
@@ -344,9 +373,9 @@ class Server {
   std::mutex db_job_mu_;
   bool db_compacting_ = false;
   bool is_bgsave_in_progress_ = false;
-  int64_t last_bgsave_time_ = -1;
+  int64_t last_bgsave_timestamp_secs_ = -1;
   std::string last_bgsave_status_ = "ok";
-  int64_t last_bgsave_time_sec_ = -1;
+  int64_t last_bgsave_duration_secs_ = -1;
 
   std::map<std::string, DBScanInfo> db_scan_infos_;
 

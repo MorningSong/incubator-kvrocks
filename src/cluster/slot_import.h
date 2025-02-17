@@ -26,6 +26,7 @@
 #include <string>
 #include <vector>
 
+#include "cluster_defs.h"
 #include "config/config.h"
 #include "server/server.h"
 #include "storage/redis_db.h"
@@ -42,18 +43,17 @@ class SlotImport : public redis::Database {
   explicit SlotImport(Server *srv);
   ~SlotImport() = default;
 
-  bool Start(int fd, int slot);
-  bool Success(int slot);
-  bool Fail(int slot);
-  void StopForLinkError(int fd);
-  int GetSlot();
+  Status Start(const SlotRange &slot_range);
+  Status Success(const SlotRange &slot_range);
+  Status Fail(const SlotRange &slot_range);
+  Status StopForLinkError();
+  SlotRange GetSlotRange();
   int GetStatus();
   void GetImportInfo(std::string *info);
 
  private:
   Server *srv_ = nullptr;
   std::mutex mutex_;
-  int import_slot_;
+  SlotRange import_slot_range_;
   int import_status_;
-  int import_fd_;
 };
